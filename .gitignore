@@ -1,0 +1,26 @@
+# ---- R / RStudio session state ----
+.RData
+.RDataTmp*
+.Rhistory
+.Rprofile
+.Renviron
+.Rproj.user/
+Rplots.pdf
+
+# ---- Downloaded data: get it yourself (see README, "Data") ----
+/data/public/
+/data/gtfs/
+
+# ---- Everything the pipeline generates ----
+# (except the designed-network feeds in outputs/gtfs/, tracked for inspection)
+/outputs/*
+!/outputs/gtfs/
+/outputs/gtfs/*
+!/outputs/gtfs/gtfs_grid_*.zip
+!/outputs/gtfs/gtfs_node_*.zip
+/cache/
+/logs/
+*.html
+*.knit.md
+*_files/
+*.log

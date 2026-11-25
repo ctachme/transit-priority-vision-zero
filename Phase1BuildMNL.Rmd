@@ -1,0 +1,2645 @@
+---
+title: "Seattle Mode Choice MNL — End-to-End Pipeline"
+author: "Stepsic Thesis"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+params:
+  trips_csv:
+    label: "PSRC Household Travel Survey trips CSV (compiled across all years)"
+    value: "./data/public/psrc_hts/hts_trips.csv"
+  households_csv:
+    label: "PSRC Household Travel Survey households CSV"
+    value: "./data/public/psrc_hts/hts_households.csv"
+  osm_pbf:
+    label: "OpenStreetMap extract (.osm.pbf)"
+    value: "./data/public/osm/washington-260122.osm.pbf"
+  gtfs_zip:
+    label: "Puget Sound consolidated GTFS feed (.zip)"
+    value: "./data/gtfs/puget_sound_consolidated_spring26.zip"
+  census_api_key:
+    label: "Census Bureau API key (for tract polygons + decennial block population)"
+    value: ""
+  parking_tiers_url:
+    label: "SDOT paid-parking tier polygons (GeoJSON URL)"
+    value: "https://services.arcgis.com/ZOyb2t4B0UYuYNYH/arcgis/rest/services/Parking_Tiers/FeatureServer/0/query?where=1%3D1&outFields=*&outSR=4326&f=geojson"
+  parking_rpz_url:
+    label: "SDOT Restricted Parking Zone polygons (GeoJSON URL)"
+    value: "https://services.arcgis.com/ZOyb2t4B0UYuYNYH/arcgis/rest/services/Restricted_Parking_Zone_Areas/FeatureServer/4/query?where=1%3D1&outFields=RPZ_ZONE&outSR=4326&f=geojson"
+  parking_garages_url:
+    label: "SDOT public garages and lots (GeoJSON URL)"
+    value: "https://services.arcgis.com/ZOyb2t4B0UYuYNYH/arcgis/rest/services/Public_Garages_and_Parking_Lots/FeatureServer/1/query?where=1%3D1&outFields=*&outSR=4326&f=geojson"
+  parking_blockface_url:
+    label: "SDOT blockface inventory - PARKING_TIME_LIMIT by segment (GeoJSON URL)"
+    value: "https://services.arcgis.com/ZOyb2t4B0UYuYNYH/arcgis/rest/services/Blockface/FeatureServer/1/query?where=1%3D1&outFields=PARKING_TIME_LIMIT,PAID_SPACES,PARKING_CATEGORY&outSR=4326&f=geojson"
+  parking_nhoods_url:
+    label: "NMA neighborhoods - L_HOOD district incl. Downtown (GeoJSON URL)"
+    value: "https://services.arcgis.com/ZOyb2t4B0UYuYNYH/arcgis/rest/services/nma_nhoods_main/FeatureServer/0/query?where=1%3D1&outFields=L_HOOD&outSR=4326&f=geojson"
+  osm_tiles_sc_dir:
+    label: "Optional folder of pre-cached osmdata_sc tiles (.rds, named tile_sc_<bbox>.rds). If supplied, dodgr is built with turn penalties from these tiles instead of from the .osm.pbf. Empty string to skip."
+    value: "./cache/osm_tiles_sc"
+  cache_dir:
+    label: "Directory for cached intermediate artifacts (auto-created)"
+    value: "./cache"
+  output_dir:
+    label: "Directory for final outputs (auto-created)"
+    value: "./outputs/phase1"
+  base_monday:
+    label: "Reference Monday for transit routing (must be inside GTFS validity window)"
+    value: "2026-04-13"
+  n_threads:
+    label: "Number of parallel threads for routing/calibration (defaults to all cores - 1)"
+    value: 0
+  force_rebuild:
+    label: "If TRUE, ignore caches and rebuild every stage from inputs"
+    value: false
+---
+
+# Overview
+
+End-to-end pipeline that estimates the Phase 1 mode-choice MNL described in
+the methodology section of the thesis. Inputs are five external artifacts
+(see YAML `params`); everything else is computed from those inputs.
+
+The fitted model is a multinomial logit with four alternatives (drive,
+walk, bike, transit) and the production specification:
+
+```
+choice ~ cost + walking_min_alt + bike_tt_alt + drive_tt_alt +
+         transit_total_diff_alt + vc_drive_alt | is_work
+```
+
+where `cost` for the drive alternative is divided by trip party size
+(`travelers_total`) to model cost-splitting among carpoolers,
+`walking_min_alt` pools walk-mode time and walk-to-stop time on a single
+generic-walking coefficient, and `transit_total_diff_alt` is
+`(transit_ivtt + transit_wait) - drive_tt` (the diff specification that
+identifies cleanly off within-OD time-of-day variation).
+
+Pipeline stages:
+
+1. Auto-install + load packages, set hardware tuning
+2. Load PSRC trips + households (handles all four survey years)
+3. Pull Census tract polygons, blocks, and Seattle place boundary
+4. Compute population-weighted tract centroids
+5. Filter to trips with both endpoints in Seattle
+6. Build r5r and dodgr networks from the OSM pbf and GTFS zips
+7. Compute walk, bike, transit, and drive skims (parallel + cached)
+8. GAM-calibrate drive time against observed PSRC trip durations
+9. Mock-fill intra-tract trips via average speeds
+10. Compute parking impedance via logsum across paid-curb / garage / free candidates
+11. Estimate per-household transit fare from composition + income
+12. Build the choice-long table and fit the MNL
+13. Save fitted model, coefficient table, VOTTs, run metadata
+
+Every stage caches its output keyed on the hash of its upstream inputs;
+re-runs with unchanged inputs reuse the cache, while changed inputs
+invalidate downstream stages.
+
+# 1. Setup
+
+## 1a. Auto-install + load packages
+
+```{r setup-packages, message = FALSE}
+.required_pkgs <- c(
+  "dplyr", "tidyr", "stringr", "readr", "lubridate", "purrr",
+  "data.table", "progress", "digest", "jsonlite", "fs", "glue",
+  "sf", "tigris", "tidycensus", "lwgeom",
+  "r5r", "dodgr", "osmextract", "FNN",
+  "mgcv", "mlogit", "dfidx", "forcats",
+  "RcppParallel", "future", "future.apply"
+)
+
+.installed <- rownames(utils::installed.packages())
+.missing <- setdiff(.required_pkgs, .installed)
+if (length(.missing)) {
+  message(sprintf("Installing %d missing packages: %s",
+                  length(.missing), paste(.missing, collapse = ", ")))
+  utils::install.packages(.missing, repos = "https://cloud.r-project.org",
+                          dependencies = TRUE)
+}
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(stringr); library(readr)
+  library(lubridate); library(purrr); library(data.table); library(progress)
+  library(digest); library(jsonlite); library(fs); library(glue)
+  library(sf); library(tigris); library(tidycensus); library(lwgeom)
+  library(r5r); library(dodgr); library(osmextract); library(FNN)
+  library(mgcv); library(mlogit); library(dfidx); library(forcats)
+})
+```
+
+## 1b. Hardware tuning + global options
+
+```{r setup-hardware}
+N_VCPU <- if (params$n_threads > 0) {
+  as.integer(params$n_threads)
+} else {
+  max(1L, parallel::detectCores(logical = TRUE) - 1L)
+}
+
+# Java heap for r5r — leave plenty of room for other R objects.
+# Empirically r5r needs ~30-50 GB for Puget Sound + GTFS at the 84k OD scale.
+JAVA_HEAP_GB <- 80L
+options(java.parameters = sprintf("-Xmx%dG", JAVA_HEAP_GB))
+
+# Threading: prefer one source of parallelism per stage so threads don't
+# fight. We let dodgr/r5r/data.table own the parallelism inside their
+# stages, and constrain BLAS to one thread (mgcv handles its own).
+data.table::setDTthreads(threads = N_VCPU)
+RcppParallel::setThreadOptions(numThreads = N_VCPU)
+Sys.setenv(
+  OMP_NUM_THREADS        = as.character(min(N_VCPU, 8L)),
+  OPENBLAS_NUM_THREADS   = "1",
+  MKL_NUM_THREADS        = "1",
+  VECLIB_MAXIMUM_THREADS = "1",
+  BLIS_NUM_THREADS       = "1"
+)
+
+# sf options
+options(tigris_use_cache = TRUE)
+sf::sf_use_s2(FALSE)
+
+# Census API key
+if (nzchar(params$census_api_key)) {
+  Sys.setenv(CENSUS_API_KEY = params$census_api_key)
+  try(tidycensus::census_api_key(params$census_api_key,
+                                 install = FALSE, overwrite = TRUE),
+      silent = TRUE)
+} else if (!nzchar(Sys.getenv("CENSUS_API_KEY"))) {
+  warning("No Census API key supplied via params or CENSUS_API_KEY env var. ",
+          "Tract / block fetches will fail. Get a key at ",
+          "https://api.census.gov/data/key_signup.html")
+}
+
+# Output / cache dirs
+CACHE_DIR  <- normalizePath(params$cache_dir, mustWork = FALSE)
+OUTPUT_DIR <- normalizePath(params$output_dir, mustWork = FALSE)
+dir.create(CACHE_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+cat(sprintf("Pipeline configuration:\n"))
+cat(sprintf("  CPU threads:    %d\n", N_VCPU))
+cat(sprintf("  Java heap:      %d GB\n", JAVA_HEAP_GB))
+cat(sprintf("  Cache dir:      %s\n", CACHE_DIR))
+cat(sprintf("  Output dir:     %s\n", OUTPUT_DIR))
+cat(sprintf("  Force rebuild:  %s\n", params$force_rebuild))
+```
+
+## 1c. Constants
+
+All values are reported here so a reviewer can challenge any number with
+one place to look. Citations are in the methodology section.
+
+```{r setup-constants}
+# Monetary parameters
+DRIVE_COST_PER_MILE      <- 0.77   # AAA "Your Driving Costs" 2025 15k miles/yr car composite
+TRANSIT_FARE_ADULT       <- 3.00   # KCM 2025 effective Sep 1, 2025
+TRANSIT_FARE_LOWINC      <- 1.00   # reduced fare: ORCA Lift + Regional Reduced Fare (senior), both $1
+TRANSIT_FARE_YOUTH       <- 0.00   # KCM youth ride free
+TRANSIT_FARE_STUDENT     <- 0.00   # institutional pass approximation
+TRANSIT_EMPLOYER_FREE_SHARE <- 0.59  # share of commuters with employer-paid ORCA
+TRANSIT_FARE_WORKER      <- TRANSIT_FARE_ADULT * (1 - TRANSIT_EMPLOYER_FREE_SHARE)  # $3 x 0.41 = $1.23
+# ORCA LIFT ceiling: gross household income <= 200% of the Federal Poverty Level
+# (2025 HHS guidelines, 48 states): $15,650 for 1 person, +$5,500 each additional.
+TRANSIT_FPL_BASE_USD     <- 15650
+TRANSIT_FPL_PER_PERSON   <- 5500
+TRANSIT_LIFT_FPL_MULT    <- 2.0
+
+# r5r / dodgr routing limits
+R5_MAX_TRIP_MIN          <- 180L
+R5_MAX_WALK_MIN          <- 180L
+R5_MAX_BIKE_MIN          <- 180L
+R5_MAX_CAR_MIN           <- 180L
+TRANSIT_ROUTING_WALK_MIN <- 45L     # max walk per leg in transit routing
+TRANSIT_ROUTING_TOTAL_MIN<- 180L
+MAX_TRANSIT_RIDES        <- 4L
+
+# Transit feasibility thresholds for choice-set availability
+MAX_TRANSIT_WALK_MIN     <- 45
+MAX_TRANSIT_WAIT_MIN     <- 60
+MAX_TRANSIT_TOTAL_MIN    <- 180
+
+# Transit skim: 20-min window centered on the representative hour.
+TRANSIT_WINDOW_PRE       <- 10L
+TRANSIT_WINDOW_POST      <- 10L
+TRANSIT_TIME_WINDOW      <- TRANSIT_WINDOW_PRE + TRANSIT_WINDOW_POST
+
+# Chunk sizes for routing (tuned for 16 vCPUs / 110 GB RAM)
+R5_PAIR_CHUNK_SIZE        <- 2000L
+TRANSIT_ORIGIN_CHUNK_SIZE <- 200L
+
+# Parking impedance (see methodology)
+PARK_VOT_USD_PER_HR              <- 28.54  # Seattle value of time ($/hr)
+PARK_GARAGE_DEFAULT_USD_PER_HR   <- list(downtown = 8.0, non_downtown = 3.0)
+PARK_WALK_SPEED_M_PER_MIN        <- 80
+PARK_CIRCUITY                    <- 1.4
+PARK_CURB_OCCUPANCY              <- 0.85   # SDOT performance-pricing target ceiling
+PARK_CURB_WALK_M                 <- 40     # half average Seattle block width
+PARK_GARAGE_ACCESS_MIN           <- 2.0    # Ricker BTS rosap, half store+deliver
+PARK_MAX_CANDIDATE_M             <- 800    # 0.5 mi walk-shed
+# Parking-choice dispersion = walk time across the 0.5-mi candidate radius
+# (800 m / 80 m per min = 10 min). The Gumbel scale theta is set so the SD of
+# each option's unobserved preference equals that dispersion: SD = theta*pi/sqrt(6).
+PARK_LOGSUM_DISPERSION_MIN       <- PARK_MAX_CANDIDATE_M / PARK_WALK_SPEED_M_PER_MIN  # = 10 min
+PARK_LOGSUM_THETA_MIN            <- PARK_LOGSUM_DISPERSION_MIN * sqrt(6) / pi          # ~ 7.80 min
+PARK_RPZ_DIFFICULTY_MULTIPLIER   <- 2.0
+PARK_RPZ_LIMIT_HR                <- 2.0    # RPZ non-permit visitor time limit (hours)
+PARK_MAX_DWELL_HR                <- 12     # cap parking dwell (long "dwells" are HTS artifacts)
+PARK_MIN_UNPAID_SHARE            <- 0.10
+
+# Numerical guards
+MIN_POSITIVE_MI  <- 1e-3
+
+# Reference Monday (must lie inside GTFS validity)
+BASE_MONDAY <- as.Date(params$base_monday)
+
+# Day-of-week ordering used to project HTS travel_dow → calendar date
+DOW_LEVELS <- c("Monday", "Tuesday", "Wednesday", "Thursday",
+                "Friday", "Saturday", "Sunday")
+
+# CRS choices: 4326 for r5r/lon-lat, 32610 (UTM 10N) for metric ops
+CRS_LL    <- 4326
+CRS_PLANAR <- 32610
+```
+
+## 1d. Helpers
+
+```{r setup-helpers}
+# Verbose timestamped logging. Every stage uses these so the run log is
+# uniformly readable. log_stage() opens a new section; log_msg() inside.
+.log_start_time <- Sys.time()
+
+log_stage <- function(stage) {
+  sep <- paste(rep("=", 76), collapse = "")
+  cat("\n", sep, "\n", sep = "")
+  cat(sprintf("[%s] %s\n",
+              format(Sys.time(), "%Y-%m-%d %H:%M:%S"), stage))
+  cat(sep, "\n", sep = "")
+}
+
+log_msg <- function(...) {
+  cat(sprintf("[%s] %s\n",
+              format(Sys.time(), "%H:%M:%S"),
+              paste0(..., collapse = "")))
+}
+
+log_done <- function(label, t0) {
+  dt <- difftime(Sys.time(), t0, units = "secs")
+  cat(sprintf("[%s] DONE %s (%.1f sec)\n",
+              format(Sys.time(), "%H:%M:%S"),
+              label, as.numeric(dt)))
+}
+
+# Cache: hash inputs and store on disk. with_cache() takes a label, an
+# arbitrary list of inputs (hashed via digest::digest), and a builder
+# closure; if the cache file exists AND the input hash matches the stored
+# manifest, returns the cached object, else rebuilds + caches.
+with_cache <- function(label, inputs, builder) {
+  hash <- digest::digest(list(label = label, inputs = inputs),
+                         algo = "sha1")
+  payload_path <- file.path(CACHE_DIR, sprintf("%s_%s.rds", label, hash))
+  manifest_path <- file.path(CACHE_DIR, sprintf("%s_%s.json", label, hash))
+
+  if (!params$force_rebuild &&
+      file.exists(payload_path) && file.exists(manifest_path)) {
+    log_msg(sprintf("Cache HIT  for %s [%s]", label, substr(hash, 1, 8)))
+    return(readRDS(payload_path))
+  }
+
+  log_msg(sprintf("Cache MISS for %s [%s] -- building", label,
+                  substr(hash, 1, 8)))
+  t0 <- Sys.time()
+  obj <- builder()
+  saveRDS(obj, payload_path)
+  jsonlite::write_json(
+    list(label = label, hash = hash,
+         built_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+         seconds = as.numeric(difftime(Sys.time(), t0, units = "secs"))),
+    manifest_path, auto_unbox = TRUE, pretty = TRUE
+  )
+  log_done(sprintf("cached %s", label), t0)
+  obj
+}
+
+# File hash for cache invalidation. Hash size + mtime (cheap) is enough for
+# our purposes — full content hash on multi-GB pbfs would be prohibitive.
+file_signature <- function(path) {
+  if (!file.exists(path)) return(list(path = path, exists = FALSE))
+  fi <- file.info(path)
+  list(path = path, size = fi$size, mtime = format(fi$mtime, "%Y-%m-%d %H:%M:%S"))
+}
+
+# 11-digit GEOID cleaner (state+county+tract).
+clean_geoid11 <- function(x) {
+  x <- str_replace_all(as.character(x), "[^0-9]", "")
+  substr(str_pad(x, 11, pad = "0"), 1, 11)
+}
+
+# PSRC mode_class → 4-mode taxonomy (drive includes ride-hail; bike
+# includes micromobility/e-scooter).
+normalize_mode <- function(mode_class) {
+  m <- toupper(str_squish(as.character(mode_class)))
+  case_when(
+    str_detect(m, "WALK")                  ~ "walk",
+    str_detect(m, "BIKE|BICYCLE|MICROMOB") ~ "bike",
+    str_detect(m, "TRANSIT")               ~ "transit",
+    str_detect(m, "DRIVE|AUTO|CAR|HAIL")   ~ "drive",
+    TRUE                                   ~ NA_character_
+  )
+}
+
+# PSRC time-of-day buckets (PSRC 2009 Travel Demand Forecasting).
+tod_bin <- function(h) {
+  h <- as.integer(h)
+  case_when(
+    h >= 6  & h < 10 ~ "AM",
+    h >= 10 & h < 16 ~ "Midday",
+    h >= 16 & h < 19 ~ "PM",
+    h >= 19 & h < 23 ~ "Evening",
+    TRUE             ~ "Night"
+  )
+}
+
+dow_type_from_date <- function(x) {
+  ifelse(lubridate::wday(x, week_start = 1) %in% c(6, 7), "Weekend", "Weekday")
+}
+
+# Income bucket text → midpoint in $1000. PSRC HTS uses strings like
+# "Under $10,000", "$25,000-$49,999", "$200,000 or more".
+parse_income_midpoint_k <- function(x) {
+  s <- str_squish(as.character(x))
+  s2 <- str_replace_all(s, "[$,]", "")
+  lo <- readr::parse_number(str_extract(s2, "^\\d+"))
+  hi <- readr::parse_number(str_extract(s2, "(?<=-)\\d+"))
+  out <- case_when(
+    is.na(s) ~ NA_real_,
+    str_detect(s2, regex("prefer not|dont know|don't know", ignore_case = TRUE)) ~ NA_real_,
+    str_detect(s2, regex("^under\\s*\\d+", ignore_case = TRUE)) ~ hi / 2,
+    str_detect(s2, regex("or more", ignore_case = TRUE)) ~ lo + 50000,
+    !is.na(lo) & !is.na(hi) ~ (lo + hi) / 2,
+    TRUE ~ NA_real_
+  )
+  out / 1000
+}
+
+# PSRC HTS encodes travelers_total as text ("1 traveler", "5+ travelers",
+# "Missing Response"), and the column also suffers occasional CSV-parsing
+# corruption (column 56 mode_other_specify can contain unescaped commas
+# that shift columns rightward). Parse only the canonical "N traveler(s)"
+# form; everything else → NA → impute median below.
+parse_travelers <- function(x) {
+  m <- stringr::str_match(as.character(x),
+                          "^\\s*([0-9]+)\\+?\\s*travelers?\\s*$")
+  as.integer(m[, 2])
+}
+
+safe_median <- function(x) {
+  x <- x[is.finite(x)]
+  if (!length(x)) return(NA_real_)
+  as.numeric(stats::median(x))
+}
+
+weighted_mean_safe <- function(x, w) {
+  ok <- is.finite(x) & is.finite(w) & w > 0
+  if (!any(ok)) return(NA_real_)
+  weighted.mean(x[ok], w[ok])
+}
+
+chunk_indices <- function(n, chunk_size) {
+  if (n == 0) return(list())
+  split(seq_len(n), ceiling(seq_len(n) / chunk_size))
+}
+
+# Convert dollars to minutes via assumed VOT (used only inside the
+# parking logsum, not the upper-level MNL).
+usd_to_min <- function(usd, vot_usd_per_hr = PARK_VOT_USD_PER_HR) {
+  usd / vot_usd_per_hr * 60
+}
+
+walk_min_from_m <- function(d_m) {
+  pmax(d_m, 0) * PARK_CIRCUITY / PARK_WALK_SPEED_M_PER_MIN
+}
+
+# Shoup-shape parking search time: flat at low occupancy, rises sharply
+# past the SDOT 85% target. Boundaries are inclusive on the upper edge.
+search_min_from_occ <- function(occ) {
+  case_when(
+    is.na(occ)  ~ 2.0,
+    occ <= 0.70 ~ 0.5,
+    occ <= 0.80 ~ 1.5,
+    occ <= 0.85 ~ 3.0,
+    occ <= 0.90 ~ 5.0,
+    occ <= 0.95 ~ 8.0,
+    TRUE        ~ 12.0
+  )
+}
+
+# Logit-style logsum across parking candidates, returns generalized cost
+# in minutes (lower is better).
+parking_logsum <- function(candidate_cost_min, theta = PARK_LOGSUM_THETA_MIN) {
+  ok <- is.finite(candidate_cost_min)
+  if (!any(ok)) return(NA_real_)
+  c <- candidate_cost_min[ok]
+  -theta * log(sum(exp(-c / theta)))
+}
+
+# Expected attribute under the parking logit (used to recover expected
+# money / search / walk components corresponding to the chosen candidate).
+expected_under_logit <- function(value, candidate_cost_min,
+                                 theta = PARK_LOGSUM_THETA_MIN) {
+  ok <- is.finite(candidate_cost_min) & is.finite(value)
+  if (!any(ok)) return(NA_real_)
+  c <- candidate_cost_min[ok]
+  v <- value[ok]
+  w <- exp(-c / theta)
+  sum(v * w) / sum(w)
+}
+
+# Number of forced relocations ("re-parks") during a stay of dwell_hr under a
+# posted time limit of limit_hr. Zero when the limit is missing or non-binding.
+reparks <- function(dwell_hr, limit_hr) {
+  n <- ceiling(dwell_hr / limit_hr) - 1
+  n[!is.finite(limit_hr) | limit_hr <= 0] <- 0
+  pmax(0, n)
+}
+
+# Length-weighted median (used to summarise blockface time limits per tract).
+weighted_median <- function(x, w) {
+  ok <- is.finite(x) & is.finite(w) & w > 0
+  if (!any(ok)) return(NA_real_)
+  x <- x[ok]; w <- w[ok]
+  o <- order(x); x <- x[o]
+  cw <- cumsum(w[o]) / sum(w)
+  x[which(cw >= 0.5)[1]]
+}
+
+# Total garage price for a stay of dwell_hr from the duration-tiered schedule
+# (RTE_1HR/2HR/3HR/ALLDAY are cumulative totals; pick the smallest tier that
+# covers the stay, capped at all-day). NA if no tier is known.
+garage_money_tiered <- function(dwell_hr, r1, r2, r3, rall) {
+  base <- case_when(
+    dwell_hr <= 1 ~ coalesce(r1, r2, r3, rall),
+    dwell_hr <= 2 ~ coalesce(r2, r3, rall, r1),
+    dwell_hr <= 3 ~ coalesce(r3, rall, r2, r1),
+    TRUE          ~ coalesce(rall, r3, r2, r1)
+  )
+  pmin(base, coalesce(rall, base))
+}
+
+# Read an ArcGIS FeatureServer query layer that exceeds maxRecordCount, by
+# paging on resultOffset (ordered by OBJECTID for stable paging). Each page is
+# downloaded to a local .geojson file first -- reading straight from the URL is
+# unreliable here (GDAL can return empty geometry / dropped CRS). CRS is forced
+# from the requested outSR=4326 as a safety net. Assumes a line layer.
+read_arcgis_paged <- function(base_url, page = 2000L) {
+  pages <- list(); off <- 0L
+  repeat {
+    u  <- sprintf("%s&resultOffset=%d&resultRecordCount=%d&orderByFields=OBJECTID",
+                  base_url, off, page)
+    tf <- tempfile(fileext = ".geojson")
+    ok <- tryCatch({ utils::download.file(u, tf, quiet = TRUE, mode = "wb"); TRUE },
+                   error = function(e) FALSE)
+    chunk <- if (isTRUE(ok) && file.exists(tf) && file.size(tf) > 0L)
+      tryCatch(sf::st_read(tf, quiet = TRUE), error = function(e) NULL) else NULL
+    if (file.exists(tf)) unlink(tf)
+    if (is.null(chunk) || nrow(chunk) == 0L) break
+    pages[[length(pages) + 1L]] <- sf::st_cast(chunk, "MULTILINESTRING", warn = FALSE)
+    if (nrow(chunk) < page) break
+    off <- off + page
+  }
+  out <- do.call(rbind, pages)
+  if (!is.null(out) && is.na(sf::st_crs(out))) sf::st_crs(out) <- 4326L
+  out
+}
+
+# r5r helper: prune extra args so calls work across r5r versions.
+ettm_safe <- function(...) {
+  args <- list(...)
+  fmls <- names(formals(r5r::expanded_travel_time_matrix))
+  args <- args[names(args) %in% fmls]
+  do.call(r5r::expanded_travel_time_matrix, args)
+}
+
+# Unified r5r itinerary computation for walk/bike/car. Used for the
+# non-transit modes where we just need (origin, dest, time, distance).
+compute_pairwise_r5_itineraries <- function(r5r_network,
+                                            od_pairs,
+                                            points_df,
+                                            mode,
+                                            departure_datetime,
+                                            label,
+                                            mode_egress = "WALK",
+                                            time_window = 1L,
+                                            max_walk_time = Inf,
+                                            max_bike_time = Inf,
+                                            max_car_time = Inf,
+                                            max_trip_duration = R5_MAX_TRIP_MIN,
+                                            max_rides = MAX_TRANSIT_RIDES,
+                                            shortest_path = TRUE,
+                                            chunk_size = R5_PAIR_CHUNK_SIZE) {
+  od_pairs <- od_pairs %>%
+    distinct(origin_id, dest_id) %>%
+    mutate(origin_id = as.character(origin_id),
+           dest_id   = as.character(dest_id))
+  if (nrow(od_pairs) == 0) {
+    return(tibble(origin_id = character(), dest_id = character(),
+                  tt_min = numeric(), dist_m = numeric()))
+  }
+  idx_chunks <- chunk_indices(nrow(od_pairs), chunk_size)
+  pb <- progress::progress_bar$new(
+    format = paste0(label, " [:bar] :percent | eta: :eta | :message"),
+    total  = length(idx_chunks), clear = FALSE, width = 80)
+
+  detailed_safe <- function(...) {
+    args <- list(...)
+    fmls <- names(formals(r5r::detailed_itineraries))
+    args <- args[names(args) %in% fmls]
+    do.call(r5r::detailed_itineraries, args)
+  }
+
+  out <- vector("list", length(idx_chunks))
+  for (k in seq_along(idx_chunks)) {
+    sub <- od_pairs[idx_chunks[[k]], , drop = FALSE]
+    origins_sub <- sub %>%
+      left_join(points_df, by = c("origin_id" = "id")) %>%
+      transmute(id = origin_id, lon, lat)
+    dests_sub <- sub %>%
+      left_join(points_df, by = c("dest_id" = "id")) %>%
+      transmute(id = dest_id, lon, lat)
+    ok <- complete.cases(origins_sub) & complete.cases(dests_sub)
+    if (any(ok)) {
+      det <- detailed_safe(
+        r5r_network = r5r_network,
+        origins = origins_sub[ok, , drop = FALSE],
+        destinations = dests_sub[ok, , drop = FALSE],
+        mode = mode, mode_egress = mode_egress,
+        departure_datetime = departure_datetime,
+        time_window = time_window, shortest_path = shortest_path,
+        all_to_all = FALSE, drop_geometry = TRUE,
+        max_walk_time = max_walk_time, max_bike_time = max_bike_time,
+        max_car_time = max_car_time,
+        max_trip_duration = max_trip_duration, max_rides = max_rides,
+        n_threads = N_VCPU, progress = FALSE, verbose = FALSE)
+      dt <- data.table::as.data.table(det)
+      if (nrow(dt) > 0) {
+        out[[k]] <- dt[, .(tt_min = safe_median(total_duration),
+                           dist_m = safe_median(total_distance)),
+                       by = .(from_id, to_id)] %>%
+          as_tibble() %>%
+          transmute(origin_id = from_id, dest_id = to_id, tt_min, dist_m)
+      }
+    }
+    pb$tick(tokens = list(message = sprintf("chunk %d/%d", k, length(idx_chunks))))
+  }
+  bind_rows(out)
+}
+
+# dodgr pairwise time/distance — drops args that the current version of
+# dodgr doesn't accept (varies across releases). Pass extra hints (e.g.
+# parallel = TRUE) and they'll be silently ignored if unsupported.
+.has_formal <- function(fn, arg) arg %in% names(formals(fn))
+
+call_with_supported_args <- function(fn, ...) {
+  args <- list(...)
+  fmls <- names(formals(fn))
+  args <- args[names(args) %in% fmls]
+  do.call(fn, args)
+}
+
+dodgr_pairwise <- function(graph, from, to, fun = dodgr::dodgr_times) {
+  if (.has_formal(fun, "pairwise")) {
+    as.numeric(call_with_supported_args(
+      fun, graph = graph, from = from, to = to,
+      shortest = FALSE, pairwise = TRUE,
+      parallel = TRUE, quiet = TRUE))
+  } else {
+    u_from <- unique(from); u_to <- unique(to)
+    mat <- call_with_supported_args(
+      fun, graph = graph, from = u_from, to = u_to,
+      shortest = FALSE, parallel = TRUE, quiet = TRUE)
+    fi <- match(from, rownames(mat))
+    ti <- match(to, colnames(mat))
+    as.numeric(mat[cbind(fi, ti)])
+  }
+}
+
+# Population-weighted tract centroid from block-level pop polygons.
+compute_pop_weighted_tract_points <- function(blocks_sf, tracts_sf) {
+  blocks_sf <- st_transform(blocks_sf, CRS_PLANAR)
+  block_pts <- st_point_on_surface(blocks_sf)
+  xy <- st_coordinates(block_pts)
+  tmp <- blocks_sf %>%
+    mutate(X = xy[, 1], Y = xy[, 2],
+           pop = coalesce(as.numeric(pop), 0)) %>%
+    st_drop_geometry() %>%
+    group_by(tract_geoid) %>%
+    summarise(
+      pop_sum = sum(pop, na.rm = TRUE),
+      Xw = if_else(pop_sum > 0, sum(X * pop, na.rm = TRUE) / pop_sum,
+                   mean(X, na.rm = TRUE)),
+      Yw = if_else(pop_sum > 0, sum(Y * pop, na.rm = TRUE) / pop_sum,
+                   mean(Y, na.rm = TRUE)),
+      .groups = "drop")
+  pts <- st_as_sf(tmp, coords = c("Xw", "Yw"), crs = CRS_PLANAR) %>%
+    st_transform(CRS_LL) %>%
+    transmute(GEOID = tract_geoid, geometry = geometry)
+  missing <- setdiff(tracts_sf$GEOID, pts$GEOID)
+  if (length(missing) > 0) {
+    fallback <- tracts_sf %>% filter(GEOID %in% missing) %>%
+      st_transform(CRS_LL) %>%
+      mutate(geometry = st_point_on_surface(geometry)) %>%
+      select(GEOID, geometry)
+    pts <- bind_rows(pts, fallback)
+  }
+  pts
+}
+
+make_points_df <- function(points_sf, id_col = "GEOID") {
+  pts <- st_transform(points_sf, CRS_LL)
+  xy  <- st_coordinates(pts)
+  tibble(id = as.character(pts[[id_col]]), lon = xy[, 1], lat = xy[, 2])
+}
+
+# osmdata_sc helpers — only used if a folder of pre-cached SC tiles is
+# supplied. SC format (silicate) is required for turn penalties in dodgr.
+is_osmdata_sc <- function(x) {
+  inherits(x, "osmdata_sc") || inherits(x, "SC") || inherits(x, "sc")
+}
+
+merge_osmdata_sc_safe <- function(xs) {
+  xs <- Filter(is_osmdata_sc, xs)
+  if (!length(xs)) stop("No valid osmdata_sc tiles to merge.")
+  out <- tryCatch(Reduce(c, xs), error = function(e) NULL)
+  if (!is.null(out)) return(out)
+  out <- xs[[1]]
+  for (i in 2:length(xs)) {
+    xi <- xs[[i]]
+    nms <- intersect(names(out), names(xi))
+    for (nm in nms) {
+      if (is.data.frame(out[[nm]]) && is.data.frame(xi[[nm]])) {
+        out[[nm]] <- data.table::rbindlist(list(out[[nm]], xi[[nm]]),
+                                           use.names = TRUE, fill = TRUE)
+        out[[nm]] <- unique(out[[nm]])
+      }
+    }
+  }
+  out
+}
+```
+
+# 2. Load PSRC trips + households
+
+The methodology specifies fields drawn from each table; we restrict to
+exactly those plus the few extras needed for parking and fare estimation.
+PSRC trip ids exceed 2^31 so they must be stored as numeric, not integer.
+
+```{r load-trips}
+log_stage("Stage 2: Load PSRC trips + households")
+
+stopifnot(file.exists(params$trips_csv))
+stopifnot(file.exists(params$households_csv))
+
+log_msg(sprintf("Reading trips CSV: %s (%.1f MB)",
+                params$trips_csv,
+                file.info(params$trips_csv)$size / 1024^2))
+trips_raw <- data.table::fread(params$trips_csv, showProgress = TRUE)
+
+log_msg(sprintf("Reading households CSV: %s (%.1f MB)",
+                params$households_csv,
+                file.info(params$households_csv)$size / 1024^2))
+hh_raw <- data.table::fread(params$households_csv, showProgress = TRUE)
+
+log_msg(sprintf("Trips raw: %d rows, %d columns", nrow(trips_raw), ncol(trips_raw)))
+log_msg(sprintf("Households raw: %d rows, %d columns", nrow(hh_raw), ncol(hh_raw)))
+
+# Re-pull travelers_total via regex; it must come from raw because the
+# transmute below would otherwise interpret garbage values as NA silently.
+trips_raw[, travelers_total_parsed := parse_travelers(travelers_total)]
+n_legit_trav <- sum(!is.na(trips_raw$travelers_total_parsed))
+log_msg(sprintf("travelers_total: %d/%d (%.1f%%) parse to canonical 'N traveler(s)'",
+                n_legit_trav, nrow(trips_raw),
+                100 * n_legit_trav / nrow(trips_raw)))
+
+trips <- trips_raw %>%
+  transmute(
+    trip_id          = as.numeric(trip_id),     # PRESERVE PSRC id (>2^31)
+    household_id     = as.integer(household_id),
+    depart_dow       = as.character(travel_dow),
+    depart_hour      = as.integer(depart_time_hour),
+    dwell_mins       = as.numeric(dwell_mins),
+    dest_purpose     = as.character(dest_purpose),
+    dest_purpose_cat = as.character(dest_purpose_cat),
+    origin_id        = clean_geoid11(origin_tract20),
+    dest_id          = clean_geoid11(dest_tract20),
+    distance_miles   = as.numeric(distance_miles),
+    duration_minutes = as.numeric(duration_minutes),
+    mode_class       = as.character(mode_class),
+    mode_norm        = normalize_mode(mode_class),
+    travelers_total  = travelers_total_parsed
+  ) %>%
+  filter(!is.na(mode_norm),
+         is.finite(distance_miles), distance_miles > 0,
+         is.finite(duration_minutes), duration_minutes > 0,
+         !is.na(origin_id), !is.na(dest_id),
+         !is.na(depart_hour), depart_hour %in% 0:23,
+         !is.na(depart_dow)) %>%
+  mutate(
+    dow_i        = match(depart_dow, DOW_LEVELS),
+    depart_date  = BASE_MONDAY + (dow_i - 1L),
+    depart_dt    = as.POSIXct(depart_date, tz = "America/Los_Angeles") +
+                   depart_hour * 3600,
+    tod_bin      = tod_bin(depart_hour),
+    dow_type     = dow_type_from_date(depart_date),
+    travelers_total = pmin(coalesce(travelers_total, 1L), 5L)
+  )
+
+log_msg(sprintf("Trips after canonical filter: %d rows", nrow(trips)))
+log_msg("Mode distribution among kept trips:")
+print(trips %>% count(mode_norm) %>% arrange(desc(n)))
+
+households <- hh_raw %>%
+  transmute(
+    household_id      = as.integer(household_id),
+    vehicle_count_n   = readr::parse_number(as.character(vehicle_count)),
+    numchildren       = readr::parse_number(as.character(numchildren)),
+    numworkers        = readr::parse_number(as.character(numworkers)),
+    num_students      = readr::parse_number(as.character(num_students)),
+    numadults         = readr::parse_number(as.character(numadults)),
+    lifecycle_class   = as.character(lifecycle_class),
+    hhincome_detailed = as.character(hhincome_detailed),
+    income_k          = parse_income_midpoint_k(hhincome_detailed)
+  ) %>%
+  mutate(
+    vehicle_count_n = coalesce(vehicle_count_n, 0),
+    numchildren     = coalesce(numchildren, 0),
+    numworkers      = coalesce(numworkers, 0),
+    num_students    = coalesce(num_students, 0),
+    numadults       = pmax(coalesce(numadults, 1), 1)
+  )
+
+log_msg(sprintf("Households parsed: %d rows", nrow(households)))
+log_msg("Vehicle count distribution:")
+print(households %>% count(vehicle_count_n) %>% arrange(vehicle_count_n))
+log_msg(sprintf("Income parse rate: %.1f%% of households",
+                100 * mean(!is.na(households$income_k))))
+
+trips <- trips %>% left_join(households, by = "household_id")
+log_msg(sprintf("Trips joined to households: %d rows", nrow(trips)))
+```
+
+# 3. Census geography and Seattle filter
+
+Tract polygons via `tigris::tracts()`, decennial-census block populations
+via `tidycensus::get_decennial()`, Seattle place boundary via
+`tigris::places()`. All cached to avoid re-hitting the API.
+
+```{r census-tracts}
+log_stage("Stage 3: Census geography (tracts + blocks + Seattle boundary)")
+
+tract_ids_all <- unique(c(trips$origin_id, trips$dest_id))
+state_fips <- unique(substr(tract_ids_all, 1, 2))
+county_fips <- unique(substr(tract_ids_all, 3, 5))
+stopifnot(length(state_fips) == 1)
+log_msg(sprintf("Tract universe: %d unique tracts spanning state %s, %d counties",
+                length(tract_ids_all), state_fips, length(county_fips)))
+
+tracts_sf <- with_cache("tracts_sf",
+  list(state_fips = state_fips, county_fips = county_fips,
+       tract_count = length(tract_ids_all)),
+  function() {
+    log_msg(sprintf("Fetching tract polygons for %d counties via tigris...",
+                    length(county_fips)))
+    bind_rows(lapply(county_fips, function(cty) {
+      tigris::tracts(state = state_fips, county = cty, year = 2020,
+                     cb = TRUE, class = "sf") %>% select(GEOID)
+    })) %>%
+      st_make_valid() %>%
+      filter(GEOID %in% tract_ids_all) %>%
+      st_transform(CRS_LL)
+  })
+log_msg(sprintf("Tract polygons loaded: %d", nrow(tracts_sf)))
+
+seattle_sf <- with_cache("seattle_place",
+  list(state_fips = state_fips),
+  function() {
+    log_msg("Fetching Seattle place boundary via tigris::places...")
+    tigris::places(state = state_fips, year = 2020, cb = TRUE,
+                   class = "sf") %>%
+      filter(NAME == "Seattle") %>%
+      st_transform(CRS_LL) %>%
+      st_make_valid()
+  })
+log_msg(sprintf("Seattle place geometry: %d feature", nrow(seattle_sf)))
+
+# Decennial blocks for population-weighted centroid.
+blocks_sf <- with_cache("blocks_sf",
+  list(state_fips = state_fips, county_fips = county_fips,
+       tract_count = length(tract_ids_all)),
+  function() {
+    log_msg(sprintf("Fetching decennial-census block populations across %d counties...",
+                    length(county_fips)))
+    pb <- progress::progress_bar$new(
+      format = "blocks [:bar] :percent | :message",
+      total  = length(county_fips), clear = FALSE, width = 70)
+    purrr::map_dfr(county_fips, function(cty) {
+      pb$tick(tokens = list(message = sprintf("county %s", cty)))
+      x <- tidycensus::get_decennial(
+        geography = "block", variables = c(pop = "P1_001N"),
+        state = state_fips, county = cty, year = 2020,
+        geometry = TRUE, output = "wide")
+      x$tract_geoid <- substr(x$GEOID, 1, 11)
+      x %>%
+        transmute(GEOID, tract_geoid,
+                  pop = as.numeric(pop), geometry) %>%
+        filter(tract_geoid %in% tract_ids_all)
+    }) %>% st_make_valid()
+  })
+log_msg(sprintf("Blocks loaded: %d (across %d tracts)",
+                nrow(blocks_sf), n_distinct(blocks_sf$tract_geoid)))
+```
+
+```{r centroids-and-filter}
+log_stage("Stage 4: Population-weighted centroids + filter to intra-Seattle")
+
+tract_points_sf <- with_cache("tract_centroids",
+  list(blocks_signature = digest::digest(blocks_sf),
+       tracts_signature = digest::digest(tracts_sf)),
+  function() {
+    log_msg("Computing population-weighted tract centroids from blocks...")
+    compute_pop_weighted_tract_points(blocks_sf, tracts_sf)
+  })
+
+points_df <- make_points_df(tract_points_sf, id_col = "GEOID")
+log_msg(sprintf("Centroids: %d points (lon/lat)", nrow(points_df)))
+
+# Tag each tract with whether it intersects Seattle.
+seattle_tract_ids <- tracts_sf %>%
+  filter(lengths(st_intersects(., seattle_sf)) > 0) %>%
+  pull(GEOID)
+log_msg(sprintf("Seattle-overlapping tracts: %d", length(seattle_tract_ids)))
+
+trips_seattle <- trips %>%
+  filter(origin_id %in% seattle_tract_ids,
+         dest_id   %in% seattle_tract_ids)
+log_msg(sprintf("Intra-Seattle trips (both endpoints in Seattle): %d (%.1f%% of total)",
+                nrow(trips_seattle),
+                100 * nrow(trips_seattle) / nrow(trips)))
+log_msg("Mode share among intra-Seattle trips:")
+print(trips_seattle %>%
+        count(mode_norm) %>%
+        mutate(share = round(n / sum(n), 3)) %>%
+        arrange(desc(n)))
+
+# OD pair set fed into all routing engines downstream.
+od_pairs <- trips_seattle %>%
+  distinct(origin_id, dest_id) %>%
+  mutate(origin_id = as.character(origin_id),
+         dest_id   = as.character(dest_id))
+log_msg(sprintf("Unique OD pairs to skim: %d", nrow(od_pairs)))
+```
+
+# 4. Build routing networks
+
+## 4a. r5r network (walk + bike + transit, also drive fallback)
+
+```{r build-r5}
+log_stage("Stage 5a: Build r5r network from OSM pbf + GTFS feed(s)")
+
+# r5r builds its network inside the folder that holds its inputs, so the
+# routing folder lives in the cache and holds hard links to the OSM extract
+# and the GTFS feed (osmextract's .gpkg conversion of the extract lands there too).
+routing_dir <- file.path(CACHE_DIR, "r5r_phase1")
+dir.create(routing_dir, showWarnings = FALSE, recursive = TRUE)
+link_input <- function(src) {
+  src <- normalizePath(src, mustWork = TRUE)
+  dst <- file.path(routing_dir, basename(src))
+  if (!file.exists(dst) || file.info(dst)$size != file.info(src)$size) {
+    unlink(dst)
+    if (!isTRUE(file.link(src, dst))) file.copy(src, dst)
+  }
+  dst
+}
+pbf_files  <- link_input(params$osm_pbf)
+gtfs_files <- link_input(params$gtfs_zip)
+log_msg(sprintf("OSM pbf: %s (%.0f MB)",
+                basename(pbf_files), file.info(pbf_files)$size / 1024^2))
+log_msg(sprintf("GTFS feeds (%d): %s",
+                length(gtfs_files),
+                paste(basename(gtfs_files), collapse = ", ")))
+
+# r5r writes a network.dat alongside the inputs in routing_dir; that
+# IS the cache. If absent or older than any input, rebuild.
+network_dat <- file.path(routing_dir, "network.dat")
+inputs_newer_than_network <- if (file.exists(network_dat)) {
+  any(file.info(c(pbf_files, gtfs_files))$mtime >
+      file.info(network_dat)$mtime)
+} else {
+  TRUE
+}
+if (params$force_rebuild || inputs_newer_than_network) {
+  log_msg("Building r5r network (this can take 10-30 min on first run)...")
+  if (file.exists(network_dat)) file.remove(network_dat)
+}
+
+t0 <- Sys.time()
+r5r_network <- r5r::build_network(data_path = routing_dir,
+                                  verbose = TRUE, overwrite = FALSE)
+log_done("r5r network ready", t0)
+
+DEP_ANY <- as.POSIXct(paste0(BASE_MONDAY, " 12:00:00"),
+                      tz = "America/Los_Angeles")
+```
+
+## 4b. dodgr drive graph
+
+Two construction paths:
+
+* **Preferred** — if `params$osm_tiles_sc_dir` points at a folder of cached
+  `osmdata_sc` tile RDS files, merge them and weight (turn penalties OFF).
+  Empirically, enabling turn penalties on the merged Puget Sound graph
+  causes ~50% of intra-Seattle OD pairs to fail routing due to
+  phantom-vertex artifacts and malformed OSM turn-restriction relations.
+  The GAM calibration on observed drive times absorbs the systematic
+  accuracy loss from missing turn penalties (Phase 1 model coefficients
+  change <5% with vs without).
+* **Fallback** — read the local `.osm.pbf` via `osmextract::oe_read`
+  (clipped to a buffered bbox around the routing points). Same
+  no-turn-penalty rationale.
+
+```{r build-dodgr}
+log_stage("Stage 5b: Build dodgr drive graph")
+
+# Resolve SC-tile path: empty means skip, dir + .rds files means use them.
+sc_tiles_dir <- params$osm_tiles_sc_dir
+if (nzchar(sc_tiles_dir)) {
+  sc_tiles_dir <- normalizePath(sc_tiles_dir, mustWork = FALSE)
+  if (!dir.exists(sc_tiles_dir)) sc_tiles_dir <- ""
+}
+sc_tile_files <- if (nzchar(sc_tiles_dir)) {
+  list.files(sc_tiles_dir, pattern = "\\.rds$", full.names = TRUE)
+} else character()
+
+use_sc_path <- length(sc_tile_files) > 0
+log_msg(sprintf("dodgr build path: %s",
+                if (use_sc_path)
+                  sprintf("SC tiles (%d files in %s)",
+                          length(sc_tile_files), sc_tiles_dir)
+                else
+                  "osmextract pbf fallback"))
+
+dodgr_cache_inputs <- if (use_sc_path) {
+  list(
+    # version tag history:
+    #   v1: contracted + turn_penalty=TRUE — silently broke turn behavior
+    #   v2_no_contract: uncontracted + turn_penalty=TRUE — ~50% routing failures
+    #   v3_no_turn: contracted + turn_penalty=FALSE — clean routing, GAM
+    #     absorbs the accuracy loss
+    # Bumping the version tag invalidates older caches automatically.
+    version = "v3_no_turn",
+    path = "sc_tiles",
+    tiles = lapply(sc_tile_files, file_signature)
+  )
+} else {
+  list(
+    version = "v3_no_turn",
+    path = "pbf",
+    pbf = file_signature(pbf_files),
+    bbox = sf::st_bbox(sf::st_as_sf(points_df,
+                                    coords = c("lon", "lat"),
+                                    crs = CRS_LL))
+  )
+}
+
+dodgr_graph <- with_cache("dodgr_motorcar", dodgr_cache_inputs, function() {
+  if (use_sc_path) {
+    # ---- SC-tile path with turn penalties --------------------------------
+    log_msg(sprintf("Loading %d SC tile RDS files...", length(sc_tile_files)))
+    t1 <- Sys.time()
+    tiles <- lapply(seq_along(sc_tile_files), function(i) {
+      x <- tryCatch(readRDS(sc_tile_files[i]), error = function(e) NULL)
+      if (is_osmdata_sc(x)) x else NULL
+    })
+    tiles <- Filter(Negate(is.null), tiles)
+    log_done(sprintf("loaded %d valid SC tiles", length(tiles)), t1)
+    if (length(tiles) == 0)
+      stop("No valid osmdata_sc tiles in ", sc_tiles_dir)
+
+    log_msg("Merging SC tiles into a single streetnet...")
+    t2 <- Sys.time()
+    merged_sc <- merge_osmdata_sc_safe(tiles)
+    log_done("merged SC streetnet", t2)
+
+    # turn_penalty = FALSE: enabling turn penalties on the Puget Sound OSM
+    # extract caused ~50% of intra-Seattle OD pairs to fail routing
+    # (verified empirically with 20 sample failed pairs from a prior run):
+    #   - 50% asymmetric failure: phantom-vertex artifacts blocking some
+    #     directions (centroid snap caught a vertex with one-way exit/entry)
+    #   - 40% truly unroutable: malformed OSM turn-restriction relations
+    #     became graph-isolating edge bans
+    #   - 10% trivial intra-tract pairs (origin == dest, t = 0)
+    # The GAM calibration on observed PSRC drive times absorbs the
+    # accuracy loss from missing turn penalties; coefficients change <5%
+    # vs the turn-penalty version.
+    log_msg("Weighting graph (motorcar profile, turn penalties = FALSE)...")
+    t3 <- Sys.time()
+    g <- dodgr::weight_streetnet(merged_sc, wt_profile = "motorcar",
+                                 turn_penalty = FALSE)
+    log_msg(sprintf("Raw graph: %d edges", nrow(g)))
+
+    log_msg("Restricting to largest connected component...")
+    g <- g[g$component == 1, ]
+    log_msg(sprintf("Largest component: %d edges", nrow(g)))
+
+    # Without turn penalties, contraction is safe and improves routing
+    # speed substantially.
+    log_msg("Contracting graph (collapses degree-2 chains)...")
+    g_c <- dodgr::dodgr_contract_graph(g)
+    log_done(sprintf("contracted graph: %d edges", nrow(g_c)), t3)
+    return(g_c)
+  }
+
+  # ---- pbf fallback path (no turn penalties) -----------------------------
+  pts_sf <- sf::st_as_sf(points_df, coords = c("lon", "lat"), crs = CRS_LL)
+  bb <- sf::st_bbox(pts_sf)
+  bb_buf <- bb + c(-0.05, -0.05, 0.05, 0.05)  # ~5 km buffer
+  boundary_poly <- sf::st_as_sfc(sf::st_bbox(c(
+    xmin = bb_buf[["xmin"]], ymin = bb_buf[["ymin"]],
+    xmax = bb_buf[["xmax"]], ymax = bb_buf[["ymax"]]),
+    crs = CRS_LL))
+  log_msg(sprintf("Clipping OSM read to bbox %.4f, %.4f, %.4f, %.4f (5 km buffer)",
+                  bb_buf[["xmin"]], bb_buf[["ymin"]],
+                  bb_buf[["xmax"]], bb_buf[["ymax"]]))
+
+  log_msg("Reading driving network from pbf via osmextract::oe_read...")
+  t1 <- Sys.time()
+  drive_tags <- c("highway", "oneway", "maxspeed", "access", "motor_vehicle")
+  streetnet_sf <- osmextract::oe_read(
+    pbf_files, layer = "lines",
+    extra_tags = drive_tags,
+    boundary = boundary_poly,
+    boundary_type = "spat",
+    query = paste(
+      "SELECT * FROM lines",
+      "WHERE highway IN (",
+      "'motorway','trunk','primary','secondary','tertiary',",
+      "'unclassified','residential','service',",
+      "'motorway_link','trunk_link','primary_link',",
+      "'secondary_link','tertiary_link')"),
+    quiet = TRUE)
+  log_done(sprintf("oe_read drivable network: %d edges",
+                   nrow(streetnet_sf)), t1)
+
+  log_msg("Weighting graph (motorcar profile, no turn penalties)...")
+  t2 <- Sys.time()
+  g <- dodgr::weight_streetnet(streetnet_sf, wt_profile = "motorcar",
+                               turn_penalty = FALSE)
+  log_msg(sprintf("Raw graph: %d edges", nrow(g)))
+
+  log_msg("Restricting to largest connected component...")
+  g <- g[g$component == 1, ]
+  log_msg(sprintf("Largest component: %d edges", nrow(g)))
+
+  log_msg("Contracting graph (collapses degree-2 chains)...")
+  g_c <- dodgr::dodgr_contract_graph(g)
+  log_done(sprintf("contracted graph: %d edges", nrow(g_c)), t2)
+  g_c
+})
+
+# Count vertices via dodgr's helper rather than column-name introspection —
+# turn-penalty contracted graphs use .vx0/.vx1 internally, standard graphs
+# use from_id/to_id, and the helper handles both.
+.n_dodgr_vertices <- nrow(dodgr::dodgr_vertices(dodgr_graph))
+log_msg(sprintf("dodgr graph ready: %d edges, %d vertices",
+                nrow(dodgr_graph), .n_dodgr_vertices))
+```
+
+# 5. Compute skims
+
+## 5a. Walk skim
+
+```{r skim-walk}
+log_stage("Stage 6a: Walk skim (r5r)")
+
+skim_walk <- with_cache("skim_walk",
+  list(od = digest::digest(od_pairs),
+       points = digest::digest(points_df)),
+  function() {
+    log_msg(sprintf("Walking %d OD pairs (limit %d min, parallel x %d threads)...",
+                    nrow(od_pairs), R5_MAX_WALK_MIN, N_VCPU))
+    compute_pairwise_r5_itineraries(
+      r5r_network = r5r_network,
+      od_pairs = od_pairs, points_df = points_df,
+      mode = "WALK", departure_datetime = DEP_ANY,
+      label = "Walk skim", time_window = 1L,
+      max_walk_time = R5_MAX_WALK_MIN,
+      max_trip_duration = R5_MAX_TRIP_MIN
+    ) %>%
+      transmute(origin_id, dest_id,
+                walk_tt_raw  = tt_min,
+                walk_dist_mi = dist_m / 1609.344)
+  })
+
+log_msg(sprintf("Walk skim: %d pairs, %.1f%% finite",
+                nrow(skim_walk),
+                100 * mean(is.finite(skim_walk$walk_tt_raw))))
+log_msg("Walk time summary (min):")
+print(summary(skim_walk$walk_tt_raw))
+```
+
+## 5b. Bike skim
+
+```{r skim-bike}
+log_stage("Stage 6b: Bike skim (r5r)")
+
+skim_bike <- with_cache("skim_bike",
+  list(od = digest::digest(od_pairs),
+       points = digest::digest(points_df)),
+  function() {
+    log_msg(sprintf("Biking %d OD pairs (limit %d min)...",
+                    nrow(od_pairs), R5_MAX_BIKE_MIN))
+    compute_pairwise_r5_itineraries(
+      r5r_network = r5r_network,
+      od_pairs = od_pairs, points_df = points_df,
+      mode = "BICYCLE", departure_datetime = DEP_ANY,
+      label = "Bike skim", time_window = 1L,
+      max_bike_time = R5_MAX_BIKE_MIN,
+      max_trip_duration = R5_MAX_TRIP_MIN
+    ) %>%
+      transmute(origin_id, dest_id,
+                bike_tt_raw  = tt_min,
+                bike_dist_mi = dist_m / 1609.344)
+  })
+
+log_msg(sprintf("Bike skim: %d pairs, %.1f%% finite",
+                nrow(skim_bike),
+                100 * mean(is.finite(skim_bike$bike_tt_raw))))
+print(summary(skim_bike$bike_tt_raw))
+```
+
+## 5c. Transit skim (in-vehicle, wait, walk, n_legs by representative hour)
+
+The 20-minute window with median aggregation absorbs frequency variance
+without exposing the model to the "I just missed a bus" tail. We bin trips
+by (dow_type, tod_bin) and route each bin once at its representative hour;
+trips inherit their bin's skim. r5r's `expanded_travel_time_matrix` with
+`breakdown = TRUE` returns per-itinerary access/wait/ride/transfer/egress,
+which we sum into the four columns the production model needs.
+
+```{r skim-transit}
+log_stage("Stage 6c: Transit skim (r5r, 20-min window, median, breakdown)")
+
+skim_transit <- with_cache("skim_transit",
+  list(od = digest::digest(od_pairs),
+       points = digest::digest(points_df),
+       window = TRANSIT_TIME_WINDOW),
+  function() {
+    transit_bins <- trips_seattle %>%
+      distinct(dow_type, tod_bin, depart_date, depart_hour) %>%
+      group_by(dow_type, tod_bin) %>%
+      summarise(rep_date = min(depart_date),
+                rep_hour = as.integer(round(median(depart_hour))),
+                .groups = "drop") %>%
+      mutate(rep_datetime = as.POSIXct(
+        paste0(rep_date, " ",
+               sprintf("%02d:00:00", pmax(0, pmin(23, rep_hour)))),
+        tz = "America/Los_Angeles"))
+
+    bin_counts <- trips_seattle %>%
+      distinct(dow_type, tod_bin, origin_id, dest_id) %>%
+      group_by(dow_type, tod_bin) %>%
+      summarise(n_pairs = n(),
+                n_origins = n_distinct(origin_id),
+                .groups = "drop")
+    transit_bins <- transit_bins %>%
+      left_join(bin_counts, by = c("dow_type", "tod_bin")) %>%
+      mutate(n_pairs = coalesce(n_pairs, 0L),
+             n_origins = coalesce(n_origins, 0L))
+    log_msg("Transit bins to route:")
+    print(transit_bins %>% select(dow_type, tod_bin, rep_hour, n_origins, n_pairs))
+
+    total_chunks <- sum(pmax(1L, ceiling(transit_bins$n_origins /
+                                          TRANSIT_ORIGIN_CHUNK_SIZE)))
+    pb <- progress::progress_bar$new(
+      format = paste0("Transit skim [:bar] :percent | ",
+                      "eta: :eta | :message"),
+      total  = total_chunks, clear = FALSE, width = 90)
+
+    transit_list <- vector("list", nrow(transit_bins))
+    for (i in seq_len(nrow(transit_bins))) {
+      b <- transit_bins[i, ]
+      od_bin <- trips_seattle %>%
+        filter(dow_type == b$dow_type, tod_bin == b$tod_bin) %>%
+        distinct(origin_id, dest_id)
+      if (nrow(od_bin) == 0) next
+      origin_ids <- sort(unique(od_bin$origin_id))
+      origin_chunks <- split(
+        origin_ids,
+        ceiling(seq_along(origin_ids) / TRANSIT_ORIGIN_CHUNK_SIZE))
+      dep_dt <- b$rep_datetime - TRANSIT_WINDOW_PRE * 60
+
+      time_out <- vector("list", length(origin_chunks))
+      for (k in seq_along(origin_chunks)) {
+        o_ids <- origin_chunks[[k]]
+        od_sub <- od_bin %>% filter(origin_id %in% o_ids)
+        origins_pts <- points_df %>% filter(id %in% unique(od_sub$origin_id))
+        dests_pts   <- points_df %>% filter(id %in% unique(od_sub$dest_id))
+        if (nrow(origins_pts) > 0 && nrow(dests_pts) > 0) {
+          m <- ettm_safe(
+            r5r_network = r5r_network,
+            origins = origins_pts, destinations = dests_pts,
+            mode = c("WALK", "TRANSIT"), mode_egress = "WALK",
+            departure_datetime = dep_dt,
+            time_window = TRANSIT_TIME_WINDOW,
+            breakdown = TRUE,
+            max_walk_time = TRANSIT_ROUTING_WALK_MIN,
+            max_trip_duration = TRANSIT_ROUTING_TOTAL_MIN,
+            max_rides = MAX_TRANSIT_RIDES,
+            n_threads = N_VCPU,
+            progress = FALSE, verbose = FALSE)
+          dt_m <- data.table::as.data.table(m)
+          if (nrow(dt_m) > 0) {
+            time_out[[k]] <- dt_m[, .(
+              transit_total_raw    = safe_median(total_time),
+              transit_access_raw   = safe_median(access_time),
+              transit_wait_raw     = safe_median(wait_time),
+              transit_ivtt_raw     = safe_median(ride_time),
+              transit_transfer_raw = safe_median(transfer_time),
+              transit_egress_raw   = safe_median(egress_time),
+              transit_nrides_raw   = safe_median(as.numeric(n_rides))
+            ), by = .(from_id, to_id)] %>%
+              as_tibble() %>%
+              transmute(
+                origin_id = from_id, dest_id = to_id,
+                transit_total_raw,
+                transit_walk_raw = transit_access_raw +
+                                   transit_transfer_raw +
+                                   transit_egress_raw,
+                transit_wait_raw, transit_ivtt_raw, transit_nrides_raw) %>%
+              inner_join(od_sub, by = c("origin_id", "dest_id"))
+          }
+        }
+        pb$tick(tokens = list(message = sprintf(
+          "%s %s chunk %d/%d", b$dow_type, b$tod_bin, k,
+          length(origin_chunks))))
+      }
+
+      transit_time_bin <- bind_rows(time_out)
+      if (nrow(transit_time_bin) == 0) next
+
+      # Distance in transit network (used as availability sanity check
+      # and for diagnostics; the upper-level model uses the time
+      # components, not distance).
+      dist_chunks <- chunk_indices(nrow(od_bin), R5_PAIR_CHUNK_SIZE)
+      dist_out <- vector("list", length(dist_chunks))
+      for (k in seq_along(dist_chunks)) {
+        od_chunk <- od_bin[dist_chunks[[k]], , drop = FALSE]
+        det <- compute_pairwise_r5_itineraries(
+          r5r_network = r5r_network, od_pairs = od_chunk,
+          points_df = points_df,
+          mode = c("WALK", "TRANSIT"), mode_egress = "WALK",
+          departure_datetime = b$rep_datetime, label = "(transit-dist)",
+          time_window = 1L,
+          max_walk_time = TRANSIT_ROUTING_WALK_MIN,
+          max_trip_duration = TRANSIT_ROUTING_TOTAL_MIN,
+          max_rides = MAX_TRANSIT_RIDES, shortest_path = TRUE,
+          chunk_size = nrow(od_chunk))
+        dist_out[[k]] <- det %>%
+          transmute(origin_id, dest_id,
+                    transit_dist_mi = dist_m / 1609.344)
+      }
+      transit_dist_bin <- bind_rows(dist_out)
+      transit_list[[i]] <- transit_time_bin %>%
+        left_join(transit_dist_bin, by = c("origin_id", "dest_id")) %>%
+        mutate(dow_type = b$dow_type, tod_bin = b$tod_bin)
+    }
+    bind_rows(transit_list)
+  })
+
+log_msg(sprintf("Transit skim: %d (OD,bin) rows, %.1f%% have finite ivtt",
+                nrow(skim_transit),
+                100 * mean(is.finite(skim_transit$transit_ivtt_raw))))
+print(summary(skim_transit %>%
+                select(transit_total_raw, transit_walk_raw,
+                       transit_wait_raw, transit_ivtt_raw)))
+```
+
+## 5d. Drive skim (dodgr primary, r5r fallback for unreachable pairs)
+
+dodgr is fast and supports link-level edits we'll need in Phase 2 for
+TSP / bus-lane / AV scenarios. Where dodgr can't find a path (typically
+origins/destinations on disconnected graph fragments), we fall back to
+r5r's car routing and report the breakdown.
+
+```{r skim-drive}
+log_stage("Stage 6d: Drive skim (dodgr + r5r fallback)")
+
+skim_drive <- with_cache("skim_drive",
+  list(od = digest::digest(od_pairs),
+       points = digest::digest(points_df),
+       graph_signature = digest::digest(dodgr_graph),
+       version = "v2_knn_retry"),     # bump to invalidate v1 single-vertex caches
+  function() {
+    # K-nearest-vertex retry: the original 1-vertex-per-centroid snapping
+    # produced 36% routing failures (centroids snapping to dead-end /
+    # one-way / disconnected sub-region vertices). For each centroid we
+    # find the K nearest graph vertices, then for OD pairs that fail
+    # routing on the (k=1, k=1) candidate we retry with (k1, k2)
+    # combinations until we find a valid route or exhaust K_MAX*K_MAX
+    # attempts.
+    #
+    # Coverage matters MORE than model fit here: every OD pair that falls
+    # back to r5r is one we can't manipulate for Phase 2 scenarios
+    # (TSP / bus-lane / AV congestion all require link-level edits to the
+    # dodgr graph; r5r doesn't expose its edge weights for editing).
+    # K=10 gives 100 (k1, k2) combinations to try; later rounds are cheap
+    # because they only route still-failing pairs.
+    K_MAX <- 10L
+
+    log_msg(sprintf("Mapping centroids to %d nearest dodgr graph vertices each...",
+                    K_MAX))
+    verts <- dodgr::dodgr_vertices(dodgr_graph)
+    verts_xy <- as.matrix(verts[, c("x", "y")])
+    points_xy <- as.matrix(points_df[, c("lon", "lat")])
+    knn <- FNN::get.knnx(verts_xy, points_xy, k = K_MAX)
+    # knn$nn.index is N_centroids × K_MAX matrix of vertex indices
+    knn_vert_id <- matrix(verts$id[as.vector(knn$nn.index)],
+                          nrow = nrow(knn$nn.index))
+    rownames(knn_vert_id) <- points_df$id
+
+    # Helper: get a vertex of choice k for a given tract id.
+    knn_vertex <- function(tract_ids, k) {
+      idx <- match(tract_ids, rownames(knn_vert_id))
+      knn_vert_id[cbind(idx, rep(k, length(tract_ids)))]
+    }
+
+    # Check that every tract has its k=1 vertex (sanity).
+    miss_k1 <- sum(is.na(knn_vertex(points_df$id, 1)))
+    if (miss_k1 > 0) {
+      log_msg(sprintf("WARNING: %d centroids didn't get a k=1 vertex match",
+                      miss_k1))
+    }
+
+    # Initialize result columns.
+    out <- od_pairs %>%
+      mutate(drive_tt_dodgr = NA_real_,
+             drive_dist_dodgr_m = NA_real_,
+             snap_k    = NA_integer_,
+             o_vertex  = NA_character_,
+             d_vertex  = NA_character_)
+
+    # Outer loop: try each (k1, k2) combination, in order of increasing
+    # total snap rank. Each round only routes still-NA pairs, and only
+    # writes back to those.
+    rounds <- expand.grid(k1 = 1:K_MAX, k2 = 1:K_MAX) %>%
+      arrange(k1 + k2, k1, k2) %>%
+      as_tibble()
+
+    log_msg(sprintf("Routing in %d (k1,k2) rounds with up to %d pairs each",
+                    nrow(rounds), nrow(out)))
+    pb_rounds <- progress::progress_bar$new(
+      format = "dodgr knn-retry [:bar] :percent | round :message",
+      total  = nrow(rounds), clear = FALSE, width = 80)
+
+    for (r in seq_len(nrow(rounds))) {
+      k1 <- rounds$k1[r]; k2 <- rounds$k2[r]
+      still_na <- !is.finite(out$drive_tt_dodgr) | out$drive_tt_dodgr <= 0
+      if (!any(still_na)) {
+        pb_rounds$tick(tokens = list(message = sprintf(
+          "(%d,%d) skipped — all routed", k1, k2)))
+        next
+      }
+      sub <- out[still_na, , drop = FALSE]
+      o_vert <- knn_vertex(sub$origin_id, k1)
+      d_vert <- knn_vertex(sub$dest_id,   k2)
+      ok_input <- !is.na(o_vert) & !is.na(d_vert)
+      if (!any(ok_input)) {
+        pb_rounds$tick(tokens = list(message = sprintf(
+          "(%d,%d) no valid vertex pairs", k1, k2)))
+        next
+      }
+      sub_ok <- sub[ok_input, , drop = FALSE]
+      o_v <- o_vert[ok_input]; d_v <- d_vert[ok_input]
+      tt_sec <- dodgr_pairwise(dodgr_graph, o_v, d_v,
+                               fun = dodgr::dodgr_times)
+      dd_m   <- dodgr_pairwise(dodgr_graph, o_v, d_v,
+                               fun = dodgr::dodgr_dists)
+
+      ok_route <- is.finite(tt_sec) & tt_sec > 0 &
+                  is.finite(dd_m)   & dd_m > 0
+      if (any(ok_route)) {
+        # Map back to row indices in `out`
+        still_na_idx <- which(still_na)
+        sub_idx <- still_na_idx[ok_input][ok_route]
+        out$drive_tt_dodgr[sub_idx]     <- tt_sec[ok_route] / 60
+        out$drive_dist_dodgr_m[sub_idx] <- dd_m[ok_route]
+        out$snap_k[sub_idx]             <- k1 * 10L + k2  # encode k1k2 for diagnostics
+        out$o_vertex[sub_idx] <- o_v[ok_route]
+        out$d_vertex[sub_idx] <- d_v[ok_route]
+      }
+      pb_rounds$tick(tokens = list(message = sprintf(
+        "(%d,%d): +%d / %d still NA",
+        k1, k2, sum(ok_route), sum(still_na) - sum(ok_route))))
+    }
+
+    # Diagnostic: how many pairs were resolved at each (k1,k2) tier?
+    log_msg(sprintf("dodgr success after K=%d retry: %d / %d pairs (%.1f%%)",
+                    K_MAX, sum(is.finite(out$drive_tt_dodgr)),
+                    nrow(out), 100 * mean(is.finite(out$drive_tt_dodgr))))
+    log_msg("dodgr success counts by (k1, k2) snap tier:")
+    snap_summary <- out %>%
+      filter(is.finite(drive_tt_dodgr)) %>%
+      mutate(k1 = snap_k %/% 10L, k2 = snap_k %% 10L) %>%
+      count(k1, k2)
+    print(snap_summary)
+
+    # Radial-expansion last resort: for pairs still NA after K-NN, take
+    # ALL graph vertices within a generous radius of each centroid
+    # (ignoring the K limit) and try every combination. This is slow but
+    # we only do it for the residual unrouted pairs.
+    still_unrouted <- !is.finite(out$drive_tt_dodgr) | out$drive_tt_dodgr <= 0
+    if (any(still_unrouted)) {
+      n_still <- sum(still_unrouted)
+      log_msg(sprintf("Radial-expansion retry for %d still-unrouted pairs...",
+                      n_still))
+      RADIAL_M <- 1500   # 1.5 km — generous but not silly
+      MAX_VERTS <- 25L   # cap per side to bound combinatorics
+
+      radial_unique_tracts <- unique(c(out$origin_id[still_unrouted],
+                                       out$dest_id[still_unrouted]))
+      tract_xy <- points_df %>% filter(id %in% radial_unique_tracts)
+      # Find all vertices within RADIAL_M meters (rough — using degrees)
+      radial_deg <- RADIAL_M / 111000
+      vert_neighbors <- lapply(seq_len(nrow(tract_xy)), function(i) {
+        dx <- verts_xy[, 1] - tract_xy$lon[i]
+        dy <- verts_xy[, 2] - tract_xy$lat[i]
+        # Quick bbox filter then exact distance
+        bb <- abs(dx) <= radial_deg & abs(dy) <= radial_deg
+        idx_bb <- which(bb)
+        if (length(idx_bb) == 0) return(integer())
+        d_m <- sqrt((dx[idx_bb] * 111000)^2 + (dy[idx_bb] * 111000 *
+                                               cos(tract_xy$lat[i] * pi/180))^2)
+        keep <- d_m <= RADIAL_M
+        v_idx <- idx_bb[keep]
+        if (length(v_idx) > MAX_VERTS) {
+          v_idx <- v_idx[order(d_m[keep])][seq_len(MAX_VERTS)]
+        }
+        v_idx
+      })
+      names(vert_neighbors) <- tract_xy$id
+
+      pb_radial <- progress::progress_bar$new(
+        format = "radial retry [:bar] :percent | :message",
+        total  = n_still, clear = FALSE, width = 80)
+      still_idx <- which(still_unrouted)
+      n_recovered <- 0L
+      for (i in still_idx) {
+        o_id <- out$origin_id[i]; d_id <- out$dest_id[i]
+        o_neighbors <- vert_neighbors[[o_id]]
+        d_neighbors <- vert_neighbors[[d_id]]
+        if (length(o_neighbors) == 0 || length(d_neighbors) == 0) {
+          pb_radial$tick(tokens = list(message = "no neighbors"))
+          next
+        }
+        o_v_set <- verts$id[o_neighbors]
+        d_v_set <- verts$id[d_neighbors]
+        # Try the matrix lookup (unique-from x unique-to)
+        mat_t <- tryCatch(
+          dodgr::dodgr_times(graph = dodgr_graph,
+                             from = o_v_set, to = d_v_set,
+                             shortest = FALSE),
+          error = function(e) NULL)
+        mat_d <- tryCatch(
+          dodgr::dodgr_dists(graph = dodgr_graph,
+                             from = o_v_set, to = d_v_set,
+                             shortest = FALSE),
+          error = function(e) NULL)
+        if (is.null(mat_t) || is.null(mat_d)) {
+          pb_radial$tick(tokens = list(message = "dodgr error"))
+          next
+        }
+        # Pick the (origin_v, dest_v) cell with the minimum finite time
+        finite_cells <- which(is.finite(mat_t) & mat_t > 0 &
+                              is.finite(mat_d) & mat_d > 0)
+        if (length(finite_cells) == 0) {
+          pb_radial$tick(tokens = list(message = "no finite route"))
+          next
+        }
+        best <- finite_cells[which.min(mat_t[finite_cells])]
+        out$drive_tt_dodgr[i]     <- mat_t[best] / 60
+        out$drive_dist_dodgr_m[i] <- mat_d[best]
+        out$snap_k[i]             <- 99L  # marker for "radial fallback"
+        row_idx <- ((best - 1L) %% nrow(mat_t)) + 1L
+        col_idx <- ((best - 1L) %/% nrow(mat_t)) + 1L
+        out$o_vertex[i] <- o_v_set[row_idx]
+        out$d_vertex[i] <- d_v_set[col_idx]
+        n_recovered <- n_recovered + 1L
+        pb_radial$tick(tokens = list(message = sprintf("recovered %d", n_recovered)))
+      }
+      log_msg(sprintf("Radial retry recovered %d / %d pairs",
+                      n_recovered, n_still))
+    }
+
+    n_dodgr_total <- sum(is.finite(out$drive_tt_dodgr))
+    log_msg(sprintf("dodgr success FINAL: %d / %d pairs (%.1f%%)",
+                    n_dodgr_total, nrow(out),
+                    100 * n_dodgr_total / nrow(out)))
+
+    # r5r fallback for whatever's still unrouted (these will not be
+    # manipulable for Phase 2 link-level scenarios; tracked separately).
+    od_fail <- out %>%
+      filter(!is.finite(drive_tt_dodgr) | drive_tt_dodgr <= 0) %>%
+      distinct(origin_id, dest_id)
+    if (nrow(od_fail) > 0) {
+      log_msg(sprintf("Phase-2 NON-MANIPULABLE: %d pairs falling back to r5r CAR\n",
+                      nrow(od_fail)))
+      car_r5r <- compute_pairwise_r5_itineraries(
+        r5r_network = r5r_network, od_pairs = od_fail,
+        points_df = points_df, mode = "CAR",
+        departure_datetime = DEP_ANY, label = "r5r drive fallback",
+        time_window = 1L, max_car_time = R5_MAX_CAR_MIN,
+        max_trip_duration = R5_MAX_TRIP_MIN) %>%
+        transmute(origin_id, dest_id,
+                  drive_tt_r5r = tt_min,
+                  drive_dist_r5r_m = dist_m)
+    } else {
+      car_r5r <- tibble(origin_id = character(), dest_id = character(),
+                        drive_tt_r5r = numeric(),
+                        drive_dist_r5r_m = numeric())
+    }
+
+    final <- out %>%
+      left_join(car_r5r, by = c("origin_id", "dest_id")) %>%
+      mutate(
+        drive_tt_raw   = coalesce(drive_tt_dodgr, drive_tt_r5r),
+        drive_dist_mi  = coalesce(drive_dist_dodgr_m,
+                                  drive_dist_r5r_m) / 1609.344,
+        drive_source   = case_when(
+          is.finite(drive_tt_dodgr) & drive_tt_dodgr > 0 ~ "dodgr",
+          is.finite(drive_tt_r5r)   & drive_tt_r5r > 0   ~ "r5r_fallback",
+          TRUE                                            ~ NA_character_)
+      ) %>%
+      select(origin_id, dest_id, drive_tt_raw, drive_dist_mi, drive_source, o_vertex, d_vertex, snap_k)
+
+    log_msg("Final drive skim provenance breakdown:")
+    print(final %>% count(drive_source))
+    final
+  })
+
+log_msg(sprintf("Drive skim final: %d pairs, %.1f%% finite",
+                nrow(skim_drive),
+                100 * mean(is.finite(skim_drive$drive_tt_raw))))
+log_msg("Drive provenance:")
+print(skim_drive %>% count(drive_source))
+print(summary(skim_drive$drive_tt_raw))
+```
+
+# 6. Join skims to trips and compute availability
+
+```{r join-skims}
+log_stage("Stage 7: Join skims to trips + compute alternative availability")
+
+trips_skim <- trips_seattle %>%
+  left_join(skim_walk,    by = c("origin_id", "dest_id")) %>%
+  left_join(skim_bike,    by = c("origin_id", "dest_id")) %>%
+  left_join(skim_drive,   by = c("origin_id", "dest_id")) %>%
+  left_join(skim_transit, by = c("origin_id", "dest_id",
+                                 "dow_type", "tod_bin")) %>%
+  mutate(
+    walk_avail = is.finite(walk_tt_raw) & walk_tt_raw > 0 &
+                 is.finite(walk_dist_mi) & walk_dist_mi > 0,
+    bike_avail = is.finite(bike_tt_raw) & bike_tt_raw > 0 &
+                 is.finite(bike_dist_mi) & bike_dist_mi > 0,
+    drive_avail = is.finite(drive_tt_raw) & drive_tt_raw > 0 &
+                  is.finite(drive_dist_mi) & drive_dist_mi > 0,
+    transit_avail =
+      is.finite(transit_total_raw) & transit_total_raw > 0 &
+      is.finite(transit_dist_mi)   & transit_dist_mi > 0 &
+      is.finite(transit_walk_raw)  & transit_walk_raw <= MAX_TRANSIT_WALK_MIN &
+      is.finite(transit_wait_raw)  & transit_wait_raw <= MAX_TRANSIT_WAIT_MIN &
+      is.finite(transit_total_raw) & transit_total_raw <= MAX_TRANSIT_TOTAL_MIN &
+      (is.na(transit_nrides_raw) |
+         transit_nrides_raw <= MAX_TRANSIT_RIDES)
+  )
+
+log_msg("Per-mode availability among intra-Seattle trips:")
+print(trips_skim %>%
+        summarise(walk = mean(walk_avail), bike = mean(bike_avail),
+                  drive = mean(drive_avail), transit = mean(transit_avail)))
+log_msg("Joint availability (number of available alts per trip):")
+print(trips_skim %>%
+        mutate(n_avail = walk_avail + bike_avail + drive_avail + transit_avail) %>%
+        count(n_avail))
+```
+
+# 7. Drive-time GAM calibration
+
+GAM regresses log(observed/predicted) on log(distance) + TOD + DOW with
+peer log-ratios from same-OD-pair / TOD / DOW trips. The fitted ratio is
+then applied to dodgr's free-flow drive time to produce `drive_tt_cal`.
+
+```{r calibrate-drive}
+log_stage("Stage 8: Drive-time GAM calibration")
+
+make_drive_calibration_frame <- function(df) {
+  d <- df %>%
+    filter(mode_norm == "drive", drive_avail,
+           is.finite(duration_minutes), duration_minutes > 0,
+           is.finite(drive_tt_raw),  drive_tt_raw > 0,
+           is.finite(drive_dist_mi), drive_dist_mi > 0) %>%
+    mutate(
+      pred_time   = drive_tt_raw,
+      obs_time    = duration_minutes,
+      obs_dist_mi = pmax(distance_miles, MIN_POSITIVE_MI),
+      pred_dist_mi= pmax(drive_dist_mi, MIN_POSITIVE_MI),
+      log_ratio   = log(obs_time / pred_time),
+      w           = 1
+    )
+  grp <- d %>%
+    group_by(origin_id, dest_id, tod_bin, dow_type) %>%
+    summarise(sw = sum(w), swlr = sum(w * log_ratio), .groups = "drop")
+  td <- d %>%
+    group_by(tod_bin, dow_type) %>%
+    summarise(td_peer = weighted_mean_safe(log_ratio, w), .groups = "drop")
+  global_peer <- weighted_mean_safe(d$log_ratio, d$w)
+  d %>%
+    left_join(grp, by = c("origin_id", "dest_id", "tod_bin", "dow_type")) %>%
+    left_join(td,  by = c("tod_bin", "dow_type")) %>%
+    mutate(
+      peer_log_ratio = if_else(sw > w, (swlr - w * log_ratio) /
+                               (sw - w), NA_real_),
+      peer_log_ratio = coalesce(peer_log_ratio, td_peer, global_peer),
+      log_obs_dist   = log(obs_dist_mi),
+      log_pred_dist  = log(pred_dist_mi)
+    )
+}
+
+cal_drive_df <- make_drive_calibration_frame(trips_skim)
+log_msg(sprintf("Calibration frame: %d drive trips with valid pred & obs",
+                nrow(cal_drive_df)))
+
+cal_drive_model <- with_cache("drive_gam",
+  list(rows = nrow(cal_drive_df),
+       digest = digest::digest(cal_drive_df %>%
+                                  select(log_ratio, log_obs_dist,
+                                         log_pred_dist, peer_log_ratio,
+                                         tod_bin, dow_type))),
+  function() {
+    log_msg("Fitting GAM (REML) for drive time calibration...")
+    t0 <- Sys.time()
+    m <- tryCatch(
+      mgcv::gam(
+        log_ratio ~ s(log_obs_dist, k = 10) + s(log_pred_dist, k = 10) +
+                    ti(log_obs_dist, log_pred_dist, k = c(6, 6)) +
+                    s(peer_log_ratio, k = 8) + tod_bin + dow_type,
+        data = cal_drive_df, weights = w, method = "REML",
+        control = mgcv::gam.control(nthreads = min(N_VCPU, 8L))),
+      error = function(e) {
+        log_msg(sprintf("Full GAM failed (%s); falling back to simpler form",
+                        conditionMessage(e)))
+        mgcv::gam(
+          log_ratio ~ s(log_obs_dist, k = 10) + s(log_pred_dist, k = 10) +
+                      s(peer_log_ratio, k = 8) + tod_bin + dow_type,
+          data = cal_drive_df, weights = w, method = "REML",
+          control = mgcv::gam.control(nthreads = min(N_VCPU, 8L)))
+      })
+    log_done("GAM fit", t0)
+    m
+  })
+
+log_msg("GAM summary:")
+print(summary(cal_drive_model))
+
+# Peer-lookup tables for application to all trips (calibration frame is
+# only the drive trips; we apply to every trip's drive_tt_raw).
+peer_drive <- list(
+  od = cal_drive_df %>%
+    group_by(origin_id, dest_id, tod_bin, dow_type) %>%
+    summarise(peer_log_ratio = weighted_mean_safe(log_ratio, w),
+              .groups = "drop"),
+  td = cal_drive_df %>%
+    group_by(tod_bin, dow_type) %>%
+    summarise(td_peer = weighted_mean_safe(log_ratio, w),
+              .groups = "drop"),
+  global = weighted_mean_safe(cal_drive_df$log_ratio, cal_drive_df$w))
+
+apply_drive_calibration <- function(df) {
+  nd <- df %>%
+    mutate(pred_time = drive_tt_raw,
+           obs_dist_mi = pmax(distance_miles, MIN_POSITIVE_MI),
+           pred_dist_mi = pmax(drive_dist_mi, MIN_POSITIVE_MI)) %>%
+    left_join(peer_drive$od,
+              by = c("origin_id", "dest_id", "tod_bin", "dow_type")) %>%
+    left_join(peer_drive$td, by = c("tod_bin", "dow_type")) %>%
+    mutate(
+      peer_log_ratio = coalesce(peer_log_ratio, td_peer, peer_drive$global),
+      log_obs_dist   = log(obs_dist_mi),
+      log_pred_dist  = log(pred_dist_mi))
+  ok <- nd$drive_avail &
+        is.finite(nd$pred_time) & nd$pred_time > 0 &
+        is.finite(nd$pred_dist_mi) & nd$pred_dist_mi > 0 &
+        is.finite(nd$log_obs_dist) & is.finite(nd$log_pred_dist) &
+        is.finite(nd$peer_log_ratio)
+  out <- rep(NA_real_, nrow(nd))
+  if (any(ok)) {
+    out[ok] <- nd$pred_time[ok] *
+               exp(predict(cal_drive_model, newdata = nd[ok, ],
+                           type = "response"))
+  }
+  out
+}
+
+trips_cal <- trips_skim %>%
+  mutate(drive_tt_cal = apply_drive_calibration(.))
+
+log_msg(sprintf("drive_tt_cal computed for %.1f%% of trips with drive_avail",
+                100 * mean(is.finite(trips_cal$drive_tt_cal[trips_cal$drive_avail]))))
+log_msg("Drive time before vs after calibration (median ratio):")
+print(trips_cal %>%
+        filter(drive_avail) %>%
+        summarise(
+          median_raw = median(drive_tt_raw, na.rm = TRUE),
+          median_cal = median(drive_tt_cal, na.rm = TRUE),
+          ratio      = median_cal / median_raw))
+```
+
+# 8. Intra-tract trip handling
+
+15% of trips have origin tract == destination tract. They have no useful
+skim (centroid-to-centroid distance is zero), so we mock travel time from
+the trip's actual reported distance plus mode-specific average speeds in
+the same TOD × DOW bin from inter-tract trips. A floor of half-tract-radius
+prevents pathological zeros.
+
+```{r intratract}
+log_stage("Stage 9: Intra-tract trip handling")
+
+speed_refs <- trips_cal %>%
+  filter(origin_id != dest_id) %>%
+  transmute(tod_bin, dow_type, obs_dist = distance_miles,
+            spd_walk  = if_else(is.finite(walk_tt_raw)  & walk_tt_raw  > 0,
+                                obs_dist / (walk_tt_raw / 60),  NA_real_),
+            spd_bike  = if_else(is.finite(bike_tt_raw)  & bike_tt_raw  > 0,
+                                obs_dist / (bike_tt_raw / 60),  NA_real_),
+            spd_drive = if_else(is.finite(drive_tt_cal) & drive_tt_cal > 0,
+                                obs_dist / (drive_tt_cal / 60), NA_real_),
+            spd_transit = if_else(is.finite(transit_total_raw) & transit_total_raw > 0,
+                                obs_dist / (transit_total_raw / 60), NA_real_)) %>%
+  group_by(tod_bin, dow_type) %>%
+  summarise(across(starts_with("spd_"),
+                   ~ median(.x[is.finite(.x)], na.rm = TRUE)),
+            .groups = "drop")
+
+# Tract area (sq mi) for the half-radius floor.
+tract_area_lookup <- tracts_sf %>%
+  st_transform(CRS_PLANAR) %>%
+  mutate(tract_area_sqmi = as.numeric(st_area(geometry)) / 27878400) %>%
+  st_drop_geometry() %>%
+  select(GEOID, tract_area_sqmi)
+
+# Transit component shares for distributing transit_total_mock across
+# walk / wait / ivtt.
+transit_shares <- trips_cal %>%
+  filter(is.finite(transit_total_raw), transit_total_raw > 0) %>%
+  mutate(s_walk = transit_walk_raw / transit_total_raw,
+         s_wait = transit_wait_raw / transit_total_raw,
+         s_ivtt = transit_ivtt_raw / transit_total_raw) %>%
+  group_by(tod_bin, dow_type) %>%
+  summarise(s_walk = median(s_walk[is.finite(s_walk)], na.rm = TRUE),
+            s_wait = median(s_wait[is.finite(s_wait)], na.rm = TRUE),
+            s_ivtt = median(s_ivtt[is.finite(s_ivtt)], na.rm = TRUE),
+            .groups = "drop")
+
+trips_cal <- trips_cal %>%
+  left_join(tract_area_lookup,
+            by = c("origin_id" = "GEOID")) %>%
+  rename(origin_tract_area_sqmi = tract_area_sqmi) %>%
+  left_join(tract_area_lookup,
+            by = c("dest_id" = "GEOID")) %>%
+  rename(dest_tract_area_sqmi = tract_area_sqmi) %>%
+  left_join(speed_refs,    by = c("tod_bin", "dow_type")) %>%
+  left_join(transit_shares, by = c("tod_bin", "dow_type")) %>%
+  mutate(
+    intratract = origin_id == dest_id,
+    intratract_dist_mi = pmax(
+      distance_miles,
+      sqrt(pmax(origin_tract_area_sqmi, dest_tract_area_sqmi,
+                na.rm = TRUE) / pi) * 0.5),
+    walk_dist_mock_mi    = intratract_dist_mi * 1.15,
+    bike_dist_mock_mi    = intratract_dist_mi * 1.10,
+    drive_dist_mock_mi   = intratract_dist_mi * 1.25,
+    transit_dist_mock_mi = intratract_dist_mi * 1.25,
+    walk_tt_mock         = walk_dist_mock_mi / spd_walk * 60,
+    bike_tt_mock         = bike_dist_mock_mi / spd_bike * 60,
+    drive_tt_mock        = drive_dist_mock_mi / spd_drive * 60,
+    transit_tt_mock      = transit_dist_mock_mi / spd_transit * 60
+  ) %>%
+  mutate(
+    walk_avail  = if_else(intratract, TRUE, walk_avail),
+    bike_avail  = if_else(intratract, TRUE, bike_avail),
+    drive_avail = if_else(intratract, TRUE, drive_avail)
+    # transit_avail intentionally NOT set true: intra-tract transit
+    # rarely makes sense (you'd just walk).
+  ) %>%
+  mutate(
+    walk_tt_raw  = if_else(intratract & walk_avail  &
+                           (!is.finite(walk_tt_raw)  | walk_tt_raw  <= 0),
+                           walk_tt_mock, walk_tt_raw),
+    bike_tt_raw  = if_else(intratract & bike_avail  &
+                           (!is.finite(bike_tt_raw)  | bike_tt_raw  <= 0),
+                           bike_tt_mock, bike_tt_raw),
+    drive_tt_cal = if_else(intratract & drive_avail &
+                           (!is.finite(drive_tt_cal) | drive_tt_cal <= 0),
+                           drive_tt_mock, drive_tt_cal),
+    walk_dist_mi   = if_else(intratract & walk_avail  &
+                             (!is.finite(walk_dist_mi) | walk_dist_mi <= 0),
+                             walk_dist_mock_mi, walk_dist_mi),
+    bike_dist_mi   = if_else(intratract & bike_avail  &
+                             (!is.finite(bike_dist_mi) | bike_dist_mi <= 0),
+                             bike_dist_mock_mi, bike_dist_mi),
+    drive_dist_mi  = if_else(intratract & drive_avail &
+                             (!is.finite(drive_dist_mi) | drive_dist_mi <= 0),
+                             drive_dist_mock_mi, drive_dist_mi),
+    transit_dist_mi = if_else(intratract & transit_avail &
+                              (!is.finite(transit_dist_mi) | transit_dist_mi <= 0),
+                              transit_dist_mock_mi, transit_dist_mi)
+  ) %>%
+  mutate(
+    s_walk = coalesce(s_walk, 0.25),
+    s_wait = coalesce(s_wait, 0.20),
+    s_ivtt = coalesce(s_ivtt, 0.55),
+    s_sum  = s_walk + s_wait + s_ivtt,
+    s_walk = s_walk / s_sum, s_wait = s_wait / s_sum,
+    s_ivtt = s_ivtt / s_sum,
+    transit_total_raw = if_else(
+      intratract & transit_avail &
+        (!is.finite(transit_total_raw) | transit_total_raw <= 0),
+      transit_tt_mock, transit_total_raw),
+    transit_walk_raw = if_else(
+      intratract & transit_avail &
+        (!is.finite(transit_walk_raw) | transit_walk_raw < 0),
+      transit_tt_mock * s_walk, transit_walk_raw),
+    transit_wait_raw = if_else(
+      intratract & transit_avail &
+        (!is.finite(transit_wait_raw) | transit_wait_raw < 0),
+      transit_tt_mock * s_wait, transit_wait_raw),
+    transit_ivtt_raw = if_else(
+      intratract & transit_avail &
+        (!is.finite(transit_ivtt_raw) | transit_ivtt_raw < 0),
+      transit_tt_mock * s_ivtt, transit_ivtt_raw)
+  ) %>%
+  select(-starts_with("spd_"), -ends_with("_mock"),
+         -s_walk, -s_wait, -s_ivtt, -s_sum)
+
+log_msg(sprintf("Intra-tract trips: %d (%.1f%% of intra-Seattle)",
+                sum(trips_cal$intratract),
+                100 * mean(trips_cal$intratract)))
+log_msg("Mock-fill summary for intra-tract trips:")
+print(trips_cal %>%
+        filter(intratract) %>%
+        summarise(
+          walk_avail = mean(walk_avail),
+          bike_avail = mean(bike_avail),
+          drive_avail = mean(drive_avail),
+          median_walk_tt = median(walk_tt_raw, na.rm = TRUE),
+          median_bike_tt = median(bike_tt_raw, na.rm = TRUE),
+          median_drive_tt= median(drive_tt_cal, na.rm = TRUE)))
+```
+
+## 8b. Snapshot calibration objects for `ThesisFigures.Rmd` (Figures 3-5)
+
+`trips_skim` / `trips_cal` are built in-place and were never written to disk,
+so the calibration-figure sidecar could only run inside a live pipeline
+session. Snapshot them (and the GAM) under stable names so the sidecar can
+knit standalone. `trips_cal` is snapshotted *here* — post mock-fill, before
+the parking/fare columns it doesn't need.
+
+```{r calviz-snapshot}
+saveRDS(trips_skim,      file.path(CACHE_DIR, "calviz_trips_skim.rds"))
+saveRDS(trips_cal,       file.path(CACHE_DIR, "calviz_trips_cal.rds"))
+saveRDS(cal_drive_model, file.path(CACHE_DIR, "calviz_drive_gam.rds"))
+log_msg(sprintf("Calibration-viz snapshot written to %s (calviz_*.rds)",
+                CACHE_DIR))
+```
+
+# 9. Parking impedance (logsum across paid-curb / garage / free)
+
+Pulls SDOT layers (paid-parking tiers, RPZ, public garages, and the blockface
+inventory for per-segment time limits), computes per-destination-tract
+attributes (paid rates by TOD, RPZ coverage, garage proximity, paid-curb time
+limit), then builds a per-trip candidate set and aggregates to
+`parking_money_usd` (expected money component) plus `parking_search_min`,
+`parking_walk_min`, and `parking_restriction_min` (expected re-park time). The
+upper-level MNL only uses `parking_money_usd` (folded into `cost`), but the time
+components are saved for sensitivity analysis in Phase 2.
+
+```{r parking}
+log_stage("Stage 10: Parking impedance from SDOT layers")
+
+# 10a. Fetch and cache layers ---------------------------------------------
+parking_tiers_sf <- with_cache("parking_tiers_sf",
+  list(url = params$parking_tiers_url),
+  function() {
+    log_msg("Fetching SDOT paid-parking tiers...")
+    sf::st_read(params$parking_tiers_url, quiet = TRUE) %>%
+      st_transform(CRS_LL) %>% st_make_valid()
+  })
+log_msg(sprintf("Parking tier polygons: %d (cols: %s)",
+                nrow(parking_tiers_sf),
+                paste(setdiff(names(parking_tiers_sf), "geometry"),
+                      collapse = ", ")))
+
+rpz_sf <- with_cache("rpz_sf",
+  list(url = params$parking_rpz_url),
+  function() {
+    log_msg("Fetching SDOT RPZ polygons...")
+    sf::st_read(params$parking_rpz_url, quiet = TRUE) %>%
+      st_transform(CRS_LL) %>% st_make_valid()
+  })
+log_msg(sprintf("RPZ polygons: %d", nrow(rpz_sf)))
+
+garages_sf <- with_cache("garages_sf",
+  list(url = params$parking_garages_url),
+  function() {
+    log_msg("Fetching SDOT public garages and lots...")
+    sf::st_read(params$parking_garages_url, quiet = TRUE) %>%
+      st_transform(CRS_LL) %>% st_make_valid()
+  })
+log_msg(sprintf("Garage points: %d (cols: %s)",
+                nrow(garages_sf),
+                paste(head(setdiff(names(garages_sf), "geometry"), 10),
+                      collapse = ", ")))
+
+# Parse the garage rate schedule. The layer carries duration-tiered TOTAL
+# prices (RTE_1HR/2HR/3HR/ALLDAY) -- totals for a stay of that length, not a
+# $/hr rate. "Permit only"/blank mark non-public or unpriced garages.
+col_or_na <- function(nm) if (nm %in% names(garages_sf)) garages_sf[[nm]] else NA
+parse_rate <- function(x) {
+  v <- suppressWarnings(readr::parse_number(as.character(x)))
+  if_else(is.finite(v) & v >= 0.5 & v <= 80, v, NA_real_)
+}
+garages_sf$rte_1hr    <- parse_rate(col_or_na("RTE_1HR"))
+garages_sf$rte_2hr    <- parse_rate(col_or_na("RTE_2HR"))
+garages_sf$rte_3hr    <- parse_rate(col_or_na("RTE_3HR"))
+garages_sf$rte_allday <- parse_rate(col_or_na("RTE_ALLDAY"))
+permit_kw <- "PERMIT|LEASE|TENANT|RESERVED|MONTHLY"
+garages_sf$is_permit_only <- str_detect(
+  toupper(paste(coalesce(as.character(col_or_na("RTE_1HR")),    ""),
+                coalesce(as.character(col_or_na("RTE_ALLDAY")), ""))),
+  permit_kw)
+log_msg(sprintf("Garage rates: %d of %d priced, %d permit-only",
+                sum(is.finite(garages_sf$rte_1hr) | is.finite(garages_sf$rte_allday)),
+                nrow(garages_sf), sum(garages_sf$is_permit_only)))
+
+# Blockface inventory: per-segment PARKING_TIME_LIMIT (minutes) + paid flag.
+blockface_sf <- with_cache("blockface_sf",
+  list(url = params$parking_blockface_url),
+  function() {
+    log_msg("Fetching SDOT blockface inventory (paged)...")
+    read_arcgis_paged(params$parking_blockface_url) %>%
+      st_transform(CRS_LL) %>% st_make_valid()
+  })
+log_msg(sprintf("Blockface segments: %d (%d paid, %d with a time limit)",
+                nrow(blockface_sf),
+                sum(coalesce(as.numeric(blockface_sf$PAID_SPACES), 0) > 0),
+                sum(is.finite(suppressWarnings(
+                  as.numeric(blockface_sf$PARKING_TIME_LIMIT))))))
+
+# NMA neighborhoods: the Downtown district polygon (L_HOOD == "Downtown").
+nhoods_sf <- with_cache("nhoods_sf",
+  list(url = params$parking_nhoods_url),
+  function() {
+    log_msg("Fetching NMA neighborhoods...")
+    sf::st_read(params$parking_nhoods_url, quiet = TRUE) %>%
+      st_transform(CRS_LL) %>% st_make_valid()
+  })
+log_msg(sprintf("Neighborhood polygons: %d (%d in Downtown district)",
+                nrow(nhoods_sf),
+                sum(coalesce(nhoods_sf$L_HOOD == "Downtown", FALSE))))
+
+# 10b. Per-destination attributes -----------------------------------------
+PLANAR <- CRS_PLANAR
+dest_ids <- unique(trips_cal$dest_id)
+dest_tracts_sf <- tracts_sf %>%
+  filter(GEOID %in% dest_ids) %>%
+  rename(dest_id = GEOID) %>%
+  st_make_valid() %>% st_transform(PLANAR)
+
+# Area-weighted intersection of paid-tier polygons with each destination tract.
+tier_int <- suppressWarnings(st_intersection(
+  dest_tracts_sf,
+  parking_tiers_sf %>% st_transform(PLANAR) %>%
+    select(any_of(c("MORNING_RATE", "DAY_RATE", "EVENING_RATE")))
+)) %>%
+  mutate(a = as.numeric(st_area(.))) %>%
+  st_drop_geometry()
+
+rate_num_safe <- function(x) coalesce(readr::parse_number(as.character(x)), 0)
+
+if (nrow(tier_int) > 0) {
+  tiers_by_dest <- tier_int %>%
+    mutate(MORNING_RATE = rate_num_safe(MORNING_RATE),
+           DAY_RATE     = rate_num_safe(DAY_RATE),
+           EVENING_RATE = rate_num_safe(EVENING_RATE)) %>%
+    group_by(dest_id) %>%
+    summarise(
+      covered_area = sum(a, na.rm = TRUE),
+      rate_morning = if_else(covered_area > 0,
+        sum(a * MORNING_RATE, na.rm = TRUE) / covered_area, 0),
+      rate_day     = if_else(covered_area > 0,
+        sum(a * DAY_RATE,     na.rm = TRUE) / covered_area, 0),
+      rate_evening = if_else(covered_area > 0,
+        sum(a * EVENING_RATE, na.rm = TRUE) / covered_area, 0),
+      .groups = "drop")
+} else {
+  tiers_by_dest <- tibble(dest_id = character(), covered_area = numeric(),
+                          rate_morning = numeric(), rate_day = numeric(),
+                          rate_evening = numeric())
+}
+
+dest_attrs <- dest_tracts_sf %>%
+  st_drop_geometry() %>%
+  distinct(dest_id) %>%
+  left_join(tiers_by_dest, by = "dest_id") %>%
+  mutate(across(c(rate_morning, rate_day, rate_evening, covered_area),
+                ~ coalesce(.x, 0)))
+
+# RPZ coverage and tract area (for paid_share / unpaid_share).
+rpz_planar <- rpz_sf %>% st_transform(PLANAR) %>% st_make_valid()
+dest_attrs$dest_rpz <- as.integer(
+  lengths(st_intersects(dest_tracts_sf, rpz_planar)) > 0)
+
+rpz_int <- suppressWarnings(
+  st_intersection(dest_tracts_sf, rpz_planar)) %>%
+  mutate(a = as.numeric(st_area(.))) %>% st_drop_geometry()
+rpz_by_dest <- if (nrow(rpz_int) > 0) {
+  rpz_int %>% group_by(dest_id) %>%
+    summarise(rpz_area = sum(a, na.rm = TRUE), .groups = "drop")
+} else tibble(dest_id = character(), rpz_area = numeric())
+
+tract_area_lookup_planar <- tibble(
+  dest_id = dest_tracts_sf$dest_id,
+  tract_area = as.numeric(st_area(dest_tracts_sf)))
+
+dest_attrs <- dest_attrs %>%
+  left_join(tract_area_lookup_planar, by = "dest_id") %>%
+  left_join(rpz_by_dest, by = "dest_id") %>%
+  mutate(
+    rpz_area = coalesce(rpz_area, 0),
+    paid_share_of_dest = pmin(1, covered_area / tract_area),
+    rpz_share_of_dest  = pmin(1, rpz_area / tract_area),
+    restricted_share = pmin(1, paid_share_of_dest + rpz_share_of_dest),
+    unpaid_share = pmax(0, 1 - restricted_share))
+
+# Downtown classification from the NMA neighborhoods layer (L_HOOD == "Downtown",
+# shown as "District" in the portal). Replaces the CBD-distance heuristic.
+dest_centroids <- st_centroid(dest_tracts_sf)
+downtown_poly  <- nhoods_sf %>% filter(L_HOOD == "Downtown") %>%
+  st_transform(PLANAR) %>% st_union()
+dest_attrs <- dest_attrs %>%
+  left_join(tibble(
+    dest_id     = dest_centroids$dest_id,
+    is_downtown = lengths(st_intersects(dest_centroids, downtown_poly)) > 0),
+    by = "dest_id") %>%
+  mutate(area_type = if_else(is_downtown, "downtown", "non_downtown"))
+
+log_msg("Destination tract downtown classification:")
+print(dest_attrs %>% count(area_type))
+
+# --- Garage candidate rate: tract-level blend, 3-tier cascade --------------
+# 1: dwell-priced blended schedule of priced garages *in the tract*.
+# 2: blended curb+garage $/hr over tracts within 0.5 mi.
+# 3: blended curb+garage $/hr over the downtown / non-downtown group.
+# (4: a fixed $/hr backstop, rarely reached.) Walk distance uses the nearest
+# non-permit garage.
+garages_planar <- garages_sf %>% st_transform(PLANAR)
+garages_public <- garages_planar %>% filter(!coalesce(is_permit_only, FALSE))
+garages_priced <- garages_public %>% filter(is.finite(rte_1hr) | is.finite(rte_allday))
+nan_na <- function(x) if_else(is.nan(x), NA_real_, x)
+
+# Walk distance: nearest non-permit garage to the tract centroid.
+garage_dist_m <- if (nrow(garages_public) > 0) {
+  ni <- st_nearest_feature(dest_centroids, garages_public)
+  as.numeric(st_distance(dest_centroids, garages_public[ni, ], by_element = TRUE))
+} else rep(NA_real_, nrow(dest_centroids))
+
+# Tier 1: blended tier schedule of priced garages whose point is in the tract.
+in_tract <- if (nrow(garages_priced) > 0) {
+  garages_priced %>% select(rte_1hr, rte_2hr, rte_3hr, rte_allday) %>%
+    st_join(dest_tracts_sf %>% select(dest_id), join = st_within) %>%
+    st_drop_geometry() %>% filter(!is.na(dest_id)) %>%
+    group_by(dest_id) %>%
+    summarise(tg_r1   = nan_na(mean(rte_1hr,    na.rm = TRUE)),
+              tg_r2   = nan_na(mean(rte_2hr,    na.rm = TRUE)),
+              tg_r3   = nan_na(mean(rte_3hr,    na.rm = TRUE)),
+              tg_rall = nan_na(mean(rte_allday, na.rm = TRUE)),
+              .groups = "drop")
+} else tibble(dest_id = character(), tg_r1 = numeric(), tg_r2 = numeric(),
+              tg_r3 = numeric(), tg_rall = numeric())
+
+dest_attrs <- dest_attrs %>%
+  left_join(tibble(dest_id = dest_centroids$dest_id, garage_dist_m = garage_dist_m),
+            by = "dest_id") %>%
+  left_join(in_tract, by = "dest_id") %>%
+  mutate(curb_sig = if_else(rate_day > 0, rate_day, NA_real_),
+         park_signal_hr = nan_na(rowMeans(cbind(curb_sig, tg_r1), na.rm = TRUE)))
+
+# Tier 2: mean signal over tracts within 0.5 mi (boundary-to-boundary).
+sig <- dest_attrs$park_signal_hr[match(dest_tracts_sf$dest_id, dest_attrs$dest_id)]
+nbr_idx <- st_is_within_distance(dest_tracts_sf, dest_tracts_sf,
+                                 dist = PARK_MAX_CANDIDATE_M)
+blend_halfmi <- vapply(nbr_idx, function(ix) {
+  s <- sig[ix]; if (all(is.na(s))) NA_real_ else mean(s, na.rm = TRUE)
+}, numeric(1))
+
+# Tier 3: mean signal over the downtown / non-downtown group; tier 4 backstop.
+dest_attrs <- dest_attrs %>%
+  left_join(tibble(dest_id = dest_tracts_sf$dest_id, blend_halfmi = blend_halfmi),
+            by = "dest_id") %>%
+  group_by(area_type) %>%
+  mutate(blend_group = nan_na(mean(park_signal_hr, na.rm = TRUE))) %>%
+  ungroup() %>%
+  mutate(garage_default_hr = vapply(area_type,
+           function(a) PARK_GARAGE_DEFAULT_USD_PER_HR[[a]], numeric(1)))
+
+log_msg("Garage rate provenance:")
+print(dest_attrs %>%
+        mutate(provenance = case_when(
+          is.finite(tg_r1) | is.finite(tg_rall) ~ "1_in_tract_garages",
+          is.finite(blend_halfmi)               ~ "2_blend_within_half_mi",
+          is.finite(blend_group)                ~ "3_blend_downtown_group",
+          TRUE                                  ~ "4_hardcoded_default"
+        )) %>%
+        count(area_type, provenance))
+
+# Representative paid-curb time limit per destination tract, from the SDOT
+# blockface inventory: length-weighted median PARKING_TIME_LIMIT over paid
+# segments. Tracts with no posted limit get NA (-> no re-park penalty).
+bf_planar <- blockface_sf %>% st_transform(PLANAR) %>% st_make_valid()
+bf_planar$seg_len_m      <- as.numeric(st_length(bf_planar))
+bf_planar$time_limit_min <- suppressWarnings(as.numeric(bf_planar$PARKING_TIME_LIMIT))
+bf_planar$is_paid_seg    <- coalesce(as.numeric(bf_planar$PAID_SPACES), 0) > 0
+bf_dest <- st_point_on_surface(bf_planar) %>%
+  st_join(dest_tracts_sf %>% select(dest_id), join = st_within) %>%
+  st_drop_geometry()
+curb_limit_by_dest <- bf_dest %>%
+  filter(is_paid_seg, is.finite(time_limit_min), !is.na(dest_id)) %>%
+  group_by(dest_id) %>%
+  summarise(curb_time_limit_min = weighted_median(time_limit_min, seg_len_m),
+            .groups = "drop")
+dest_attrs <- dest_attrs %>% left_join(curb_limit_by_dest, by = "dest_id")
+log_msg(sprintf(
+  "Paid-curb time limit: %d of %d dest tracts have one (median %.0f min)",
+  sum(is.finite(dest_attrs$curb_time_limit_min)), nrow(dest_attrs),
+  suppressWarnings(median(dest_attrs$curb_time_limit_min, na.rm = TRUE))))
+
+# 10c. Compute dwell_for_parking_hr per trip ------------------------------
+dwell_purpose_median <- trips_cal %>%
+  filter(is.finite(dwell_mins), dwell_mins > 0) %>%
+  group_by(dest_purpose) %>%
+  summarise(dwell_purpose_med = median(dwell_mins), .groups = "drop")
+
+trips_cal <- trips_cal %>%
+  left_join(dwell_purpose_median, by = "dest_purpose") %>%
+  mutate(
+    dwell_for_parking_min = case_when(
+      is.finite(dwell_mins) & dwell_mins > 0 ~ as.numeric(dwell_mins),
+      is.finite(dwell_purpose_med)            ~ dwell_purpose_med,
+      TRUE                                    ~ 60),
+    dwell_for_parking_hr = pmin(dwell_for_parking_min / 60, PARK_MAX_DWELL_HR))
+
+# 10d. Build candidate set per trip and compute logsum -------------------
+trips_for_parking <- trips_cal %>%
+  left_join(dest_attrs, by = "dest_id") %>%
+  mutate(
+    paid_rate_tod = case_when(
+      tod_bin == "AM"                  ~ rate_morning,
+      tod_bin %in% c("Midday", "PM")   ~ rate_day,
+      tod_bin == "Evening"             ~ rate_evening,
+      TRUE                             ~ 0),
+    is_resident_at_dest = origin_id == dest_id)
+
+candidate_long <- bind_rows(
+  # Paid curb: re-park each time the posted curb time limit (from the SDOT
+  # blockface inventory) is exceeded.
+  trips_for_parking %>%
+    filter(paid_rate_tod > 0) %>%
+    transmute(trip_id, candidate = "paid_curb",
+              money = paid_rate_tod * dwell_for_parking_hr,
+              search_min = search_min_from_occ(PARK_CURB_OCCUPANCY),
+              walk_min = walk_min_from_m(PARK_CURB_WALK_M),
+              restriction_min = reparks(dwell_for_parking_hr,
+                                        curb_time_limit_min / 60) *
+                                (search_min + 2 * walk_min)),
+  # Garage: continuous payment, no posted limit -> no re-park.
+  trips_for_parking %>%
+    filter(!is.na(garage_dist_m), garage_dist_m <= PARK_MAX_CANDIDATE_M) %>%
+    transmute(trip_id, candidate = "garage",
+              money = coalesce(
+                garage_money_tiered(dwell_for_parking_hr,
+                                    tg_r1, tg_r2, tg_r3, tg_rall),
+                blend_halfmi      * dwell_for_parking_hr,
+                blend_group       * dwell_for_parking_hr,
+                garage_default_hr * dwell_for_parking_hr),
+              search_min = PARK_GARAGE_ACCESS_MIN,
+              walk_min = walk_min_from_m(garage_dist_m),
+              restriction_min = 0),
+  # Free on-street: search/walk doubled in an RPZ; non-permit visitors also
+  # face the RPZ visitor limit and must re-park beyond it (residents do not).
+  trips_for_parking %>%
+    filter(coalesce(unpaid_share, 1) >= PARK_MIN_UNPAID_SHARE) %>%
+    mutate(rpz_mult = if_else(dest_rpz == 1,
+                              PARK_RPZ_DIFFICULTY_MULTIPLIER, 1),
+           free_limit_hr = if_else(dest_rpz == 1 & !is_resident_at_dest,
+                                   PARK_RPZ_LIMIT_HR, NA_real_)) %>%
+    transmute(trip_id, candidate = "free",
+              money = 0,
+              search_min = search_min_from_occ(PARK_CURB_OCCUPANCY) * rpz_mult,
+              walk_min = walk_min_from_m(PARK_CURB_WALK_M * rpz_mult),
+              restriction_min = reparks(dwell_for_parking_hr, free_limit_hr) *
+                                (search_min + 2 * walk_min))
+) %>%
+  mutate(candidate_cost_min =
+           usd_to_min(money) + search_min + walk_min + restriction_min)
+
+parking_per_trip <- candidate_long %>%
+  group_by(trip_id) %>%
+  summarise(
+    parking_logsum_min   = parking_logsum(candidate_cost_min),
+    parking_money_usd    = expected_under_logit(money,
+                            candidate_cost_min),
+    parking_search_min   = expected_under_logit(search_min,
+                            candidate_cost_min),
+    parking_walk_min     = expected_under_logit(walk_min,
+                            candidate_cost_min),
+    parking_restriction_min = expected_under_logit(restriction_min,
+                            candidate_cost_min),
+    n_candidates         = n(),
+    .groups = "drop")
+
+log_msg("Parking impedance distribution (across all trips):")
+print(summary(parking_per_trip[, c("parking_logsum_min", "parking_money_usd",
+                                   "parking_search_min", "parking_walk_min",
+                                   "parking_restriction_min")]))
+log_msg("Median parking money cost by destination area type (drive trips only):")
+print(parking_per_trip %>%
+        left_join(trips_for_parking %>%
+                    select(trip_id, area_type, mode_norm),
+                  by = "trip_id") %>%
+        filter(mode_norm == "drive") %>%
+        group_by(area_type) %>%
+        summarise(median_money = median(parking_money_usd),
+                  mean_money   = mean(parking_money_usd),
+                  n = n(), .groups = "drop"))
+
+# --- Diagnostic: logit (logsum) vs deterministic cheapest-only (argmin) -----
+# Sanity check on the choice rule: how different is the probability-weighted
+# parking money from simply taking the single lowest-generalized-cost
+# candidate? The logit leaks weight onto paid options where "free" is only
+# marginally cheapest, so it should sit above the cheapest-only money.
+park_argmin <- candidate_long %>%
+  group_by(trip_id) %>%
+  slice_min(candidate_cost_min, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  transmute(trip_id, money_argmin = money, candidate_argmin = candidate)
+
+park_compare <- parking_per_trip %>%
+  transmute(trip_id, money_logit = parking_money_usd) %>%
+  left_join(park_argmin, by = "trip_id") %>%
+  left_join(trips_for_parking %>% select(trip_id, mode_norm, area_type),
+            by = "trip_id")
+
+zero_share <- function(x) mean(x < 1e-9, na.rm = TRUE)
+log_msg("Parking money: logit logsum vs cheapest-only (all trips):")
+print(park_compare %>%
+        summarise(mean_logit  = mean(money_logit,  na.rm = TRUE),
+                  mean_argmin = mean(money_argmin, na.rm = TRUE),
+                  med_logit   = median(money_logit,  na.rm = TRUE),
+                  med_argmin  = median(money_argmin, na.rm = TRUE),
+                  zero_logit  = zero_share(money_logit),
+                  zero_argmin = zero_share(money_argmin)))
+
+log_msg("Parking money: logit vs cheapest-only (drive trips, by area type):")
+print(park_compare %>%
+        filter(mode_norm == "drive") %>%
+        group_by(area_type) %>%
+        summarise(n           = n(),
+                  mean_logit  = mean(money_logit,  na.rm = TRUE),
+                  mean_argmin = mean(money_argmin, na.rm = TRUE),
+                  zero_argmin = zero_share(money_argmin),
+                  .groups = "drop"))
+
+log_msg("Cheapest-only winning candidate share (drive trips, by area type):")
+print(park_compare %>%
+        filter(mode_norm == "drive") %>%
+        count(area_type, candidate_argmin) %>%
+        group_by(area_type) %>%
+        mutate(share = round(n / sum(n), 3)) %>%
+        ungroup())
+
+trips_cal <- trips_cal %>%
+  left_join(parking_per_trip %>%
+              select(trip_id, parking_money_usd,
+                     parking_search_min, parking_walk_min,
+                     parking_restriction_min, parking_logsum_min),
+            by = "trip_id") %>%
+  mutate(parking_money_usd       = coalesce(parking_money_usd, 0),
+         parking_search_min      = coalesce(parking_search_min, 0),
+         parking_walk_min        = coalesce(parking_walk_min, 0),
+         parking_restriction_min = coalesce(parking_restriction_min, 0))
+```
+
+# 10. Per-trip transit fare estimation
+
+Blended per-rider fare from PSRC household composition (KCM 2025 schedule): the
+household fare is the average over its members, each priced by type -- children
+and students ride free ($0); workers pay an employer-subsidy-adjusted $1.23 (59%
+of commuters have an employer-paid ORCA); other adults pay the full $3; and in a
+senior-classified or ORCA-LIFT-eligible (<= 200% of the Federal Poverty Level for
+the household size) household all paying adults take the reduced $1. Implements
+the methodology section's "blend the most likely fares together."
+
+```{r transit-fares}
+log_stage("Stage 11: Per-trip transit fare estimation")
+
+# Blended per-rider fare: the average over household members of each member's
+# fare. Children and (adult) students ride free ($0). Workers pay an
+# employer-subsidy-adjusted fare (59% of commuters have an employer-paid ORCA,
+# so expected = $3 x 0.41 = $1.23); other adults pay the full $3. In a
+# senior-classified or ORCA-LIFT-eligible (<= 200% FPL for the household size)
+# household, all paying adults take the reduced $1 instead. Senior status and
+# income are only household-level (lifecycle_class, income bracket midpoint),
+# not per-person, so the reduced fare applies to all paying adults there.
+estimate_transit_fare <- function(lifecycle_class, numchildren, numadults,
+                                  numworkers, num_students, income_k) {
+  nch  <- coalesce(numchildren, 0)
+  nad  <- pmax(coalesce(numadults, 0), 0)
+  nstu <- pmin(coalesce(num_students, 0), nad)               # adult students
+  nwrk <- pmin(coalesce(numworkers, 0), pmax(nad - nstu, 0)) # workers (non-student adults)
+  noth <- pmax(nad - nstu - nwrk, 0)                         # other adults
+  people <- pmax(nad + nch, 1)
+  is_senior  <- str_detect(coalesce(lifecycle_class, ""),
+                           regex("older adults", ignore_case = TRUE))
+  lift_cap   <- TRANSIT_LIFT_FPL_MULT *
+                (TRANSIT_FPL_BASE_USD + (people - 1) * TRANSIT_FPL_PER_PERSON)
+  is_low_inc <- !is.na(income_k) & income_k * 1000 <= lift_cap
+  reduced    <- is_senior | is_low_inc
+  adult_contrib <- if_else(reduced,
+    TRANSIT_FARE_LOWINC * (nwrk + noth),                       # reduced: all paying adults $1
+    TRANSIT_FARE_WORKER * nwrk + TRANSIT_FARE_ADULT * noth)    # else workers $1.23, others $3
+  (TRANSIT_FARE_YOUTH * nch + TRANSIT_FARE_STUDENT * nstu + adult_contrib) / people
+}
+
+trips_cal <- trips_cal %>%
+  mutate(estimated_transit_fare = estimate_transit_fare(
+    lifecycle_class, numchildren, numadults, numworkers, num_students,
+    income_k))
+
+log_msg("Estimated transit fare distribution (blended per-rider):")
+print(summary(trips_cal$estimated_transit_fare))
+log_msg(sprintf(
+  "Mean fare: $%.2f | share at full $%.2f: %.1f%% | share free: %.1f%%",
+  mean(trips_cal$estimated_transit_fare),
+  TRANSIT_FARE_ADULT,
+  100 * mean(trips_cal$estimated_transit_fare == TRANSIT_FARE_ADULT),
+  100 * mean(trips_cal$estimated_transit_fare < 1e-9)))
+```
+
+# 11. Build choice-long table for MNL
+
+Produces the long-form 4-row-per-trip data frame used by `mlogit`. Implements
+the engineered variables specified in the methodology:
+
+* `walking_min_alt` = walk-mode time (when alt = walk) + walk-to-stop
+  time (when alt = transit), both pooled under a single coefficient
+  ("generic walking time" — Train & Wilson 2008).
+* `transit_total_diff_alt` = (transit_ivtt + transit_wait) − drive_tt
+  for the transit alt only, which is the diff specification that
+  identifies cleanly off within-OD time-of-day variation.
+* `vc_drive_alt` = household vehicle count, drive alt only. Targeted
+  alt-specific entry preserves transit-time identification.
+* `cost` for drive divided by `travelers_total` to model cost-splitting.
+
+```{r choice-long}
+log_stage("Stage 12: Build choice-long table")
+
+# Decision-relevant fields per trip → wide; then crossed with the four alts.
+choice_wide <- trips_cal %>%
+  transmute(
+    trip_id, mode_norm,
+    travelers_total = pmax(coalesce(travelers_total, 1L), 1L),
+    vehicle_count_n = coalesce(vehicle_count_n, 0),
+    is_work = as.integer(str_detect(coalesce(toupper(dest_purpose_cat), ""),
+                                    "WORK")),
+    walk_tt_use   = walk_tt_raw,
+    bike_tt_use   = bike_tt_raw,
+    drive_tt_use  = drive_tt_cal,
+    transit_walk  = transit_walk_raw,
+    transit_wait  = transit_wait_raw,
+    transit_ivtt  = transit_ivtt_raw,
+    walk_dist_mi, bike_dist_mi, drive_dist_mi, transit_dist_mi,
+    parking_money_usd, estimated_transit_fare,
+    walk_avail, bike_avail, drive_avail, transit_avail
+  ) %>%
+  mutate(
+    transit_ivtt_diff = transit_ivtt - drive_tt_use   # diff vs drive
+  )
+
+choice_long_raw <- choice_wide %>%
+  tidyr::crossing(alt = c("walk", "bike", "transit", "drive")) %>%
+  mutate(
+    choice = (mode_norm == alt),
+    avail  = case_when(
+      alt == "walk"    ~ walk_avail,
+      alt == "bike"    ~ bike_avail,
+      alt == "transit" ~ transit_avail,
+      alt == "drive"   ~ drive_avail),
+
+    # Cost: drive cost is split per traveler; transit fare is per-rider;
+    # walk and bike are zero.
+    cost = case_when(
+      alt == "walk"    ~ 0,
+      alt == "bike"    ~ 0,
+      alt == "transit" ~ estimated_transit_fare,
+      alt == "drive"   ~ (DRIVE_COST_PER_MILE * drive_dist_mi +
+                          parking_money_usd) / travelers_total),
+
+    # Per-alt time variables: non-zero only for the matching alt.
+    walk_tt_alt    = if_else(alt == "walk",    walk_tt_use,  0),
+    bike_tt_alt    = if_else(alt == "bike",    bike_tt_use,  0),
+    drive_tt_alt   = if_else(alt == "drive",   drive_tt_use, 0),
+    transit_walk_alt      = if_else(alt == "transit", transit_walk, 0),
+    transit_wait_alt      = if_else(alt == "transit", transit_wait, 0),
+    transit_ivtt_diff_alt = if_else(alt == "transit", transit_ivtt_diff, 0),
+
+    # Engineered variables for the production model.
+    walking_min_alt        = walk_tt_alt + transit_walk_alt,
+    transit_total_diff_alt = transit_ivtt_diff_alt + transit_wait_alt,
+    vc_drive_alt           = if_else(alt == "drive",
+                                     as.numeric(vehicle_count_n), 0)
+  )
+
+# Drop trips whose chosen alt is unavailable; drop alts that are
+# unavailable; require finite values; require exactly 1 chosen and ≥ 2
+# alternatives total.
+bad_chosen <- choice_long_raw %>%
+  filter(choice & !avail) %>%
+  distinct(trip_id) %>% pull(trip_id)
+
+choice_long <- choice_long_raw %>%
+  filter(!trip_id %in% bad_chosen, avail) %>%
+  filter(
+    is.finite(cost),
+    is.finite(walk_tt_alt), is.finite(bike_tt_alt),
+    is.finite(drive_tt_alt),
+    is.finite(walking_min_alt),
+    is.finite(transit_total_diff_alt),
+    is.finite(vc_drive_alt),
+    is.finite(is_work)
+  ) %>%
+  group_by(trip_id) %>%
+  filter(sum(choice) == 1L, n() >= 2L) %>%
+  ungroup() %>%
+  mutate(
+    alt    = factor(alt, levels = c("drive", "walk", "bike", "transit")),
+    choice = as.logical(choice),
+    trip_id = as.numeric(trip_id))
+
+n_trips_in <- n_distinct(choice_long$trip_id)
+log_msg(sprintf("Choice-long rows: %d (%d distinct trips after filtering)",
+                nrow(choice_long), n_trips_in))
+log_msg("Chosen-mode share in estimation sample:")
+print(choice_long %>%
+        filter(choice) %>%
+        count(alt) %>%
+        mutate(share = round(n / sum(n), 3)))
+```
+
+# 12. Estimate MNL
+
+```{r estimate-mnl}
+log_stage("Stage 13: Estimate MNL")
+
+t0 <- Sys.time()
+mnl <- mlogit::mlogit(
+  choice ~ cost + walking_min_alt + bike_tt_alt + drive_tt_alt +
+           transit_total_diff_alt + vc_drive_alt | is_work,
+  data = choice_long,
+  shape = "long",
+  chid.var = "trip_id",
+  alt.var  = "alt",
+  drop.index = FALSE,
+  reflevel = "drive")
+log_done("MNL fit", t0)
+
+cat("\n")
+print(summary(mnl))
+```
+
+# 13. Output: VOTTs, coefficient table, fitted model, run metadata
+
+```{r outputs}
+log_stage("Stage 14: Outputs")
+
+co <- coef(mnl)
+se <- sqrt(diag(stats::vcov(mnl)))
+beta_cost <- co[["cost"]]
+
+vott <- function(time_var) {
+  if (time_var %in% names(co)) co[[time_var]] / beta_cost * 60
+  else NA_real_
+}
+
+coef_table <- tibble(
+  variable = names(co),
+  beta     = unname(co),
+  se       = unname(se),
+  z        = unname(co / se),
+  p        = 2 * (1 - pnorm(abs(unname(co / se)))),
+  vott_usd_per_hr = if_else(
+    names(co) %in% c("walking_min_alt", "bike_tt_alt", "drive_tt_alt",
+                     "transit_total_diff_alt"),
+    unname(co) / beta_cost * 60, NA_real_))
+
+print(coef_table)
+
+vott_summary <- tibble(
+  metric = c("drive", "walking", "bike", "transit_total_diff",
+             "walking_to_transit_total_ratio",
+             "wait_time_implicit_ratio_to_drive"),
+  value = c(vott("drive_tt_alt"),
+            vott("walking_min_alt"),
+            vott("bike_tt_alt"),
+            vott("transit_total_diff_alt"),
+            co[["walking_min_alt"]] / co[["transit_total_diff_alt"]],
+            NA_real_))
+
+log_msg("VOTT summary ($/hr unless ratio):")
+print(vott_summary)
+
+# Save artifacts
+saveRDS(mnl, file.path(OUTPUT_DIR, "mnl_fit.rds"))
+saveRDS(choice_long, file.path(OUTPUT_DIR, "choice_long.rds"))
+saveRDS(trips_cal, file.path(OUTPUT_DIR, "trips_calibrated.rds"))
+write_csv(coef_table, file.path(OUTPUT_DIR, "coefficients.csv"))
+write_csv(vott_summary, file.path(OUTPUT_DIR, "vott.csv"))
+
+# Run metadata for reproducibility
+metadata <- list(
+  run_finished_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+  total_seconds = as.numeric(difftime(Sys.time(), .log_start_time,
+                                       units = "secs")),
+  n_threads = N_VCPU,
+  java_heap_gb = JAVA_HEAP_GB,
+  inputs = list(
+    trips_csv = file_signature(params$trips_csv),
+    households_csv = file_signature(params$households_csv),
+    osm_pbf = file_signature(params$osm_pbf),
+    gtfs_zip = file_signature(params$gtfs_zip),
+    base_monday = format(BASE_MONDAY, "%Y-%m-%d"),
+    parking_tiers_url = params$parking_tiers_url,
+    parking_rpz_url = params$parking_rpz_url,
+    parking_garages_url = params$parking_garages_url),
+  sample = list(
+    intra_seattle_trips = nrow(trips_seattle),
+    estimation_trips = n_trips_in,
+    estimation_rows = nrow(choice_long)),
+  model = list(
+    formula = "choice ~ cost + walking_min_alt + bike_tt_alt + drive_tt_alt + transit_total_diff_alt + vc_drive_alt | is_work",
+    log_likelihood = as.numeric(stats::logLik(mnl)),
+    coefficients = as.list(co),
+    standard_errors = as.list(se),
+    vott_usd_per_hr = list(
+      drive = vott("drive_tt_alt"),
+      walking = vott("walking_min_alt"),
+      bike = vott("bike_tt_alt"),
+      transit_total_diff = vott("transit_total_diff_alt"))),
+  package_versions = list(
+    R = R.version.string,
+    r5r = as.character(packageVersion("r5r")),
+    dodgr = as.character(packageVersion("dodgr")),
+    mlogit = as.character(packageVersion("mlogit")),
+    sf = as.character(packageVersion("sf")),
+    tigris = as.character(packageVersion("tigris")),
+    tidycensus = as.character(packageVersion("tidycensus")),
+    mgcv = as.character(packageVersion("mgcv"))))
+
+jsonlite::write_json(metadata, file.path(OUTPUT_DIR, "run_metadata.json"),
+                     auto_unbox = TRUE, pretty = TRUE, force = TRUE)
+
+log_msg(sprintf("All outputs written to %s", OUTPUT_DIR))
+log_msg(sprintf("Total wall-clock time: %.1f minutes",
+                as.numeric(difftime(Sys.time(), .log_start_time,
+                                    units = "mins"))))
+```
+
+# 14. Shutdown
+
+```{r shutdown}
+log_stage("Stage 15: Shutdown")
+try(r5r::stop_r5(r5r_network), silent = TRUE)
+log_msg("Pipeline complete.")
+```

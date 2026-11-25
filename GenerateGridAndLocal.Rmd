@@ -1,0 +1,300 @@
+---
+title: "Generate the Grid and Grid + Local GTFS feeds"
+output: html_document
+---
+
+Replaces the naive ArcPy generator (fixed 35 mph + flat 30 s/stop). Running time per
+stop-to-stop section is integrated from `Seattle_Streets` posted speeds via a bearing-filtered
+line-on-line segment join of each route alignment; dwell is a signal-based control delay
+(SDOT signals) plus accel/decel lost time using cutaway-vehicle characteristics. Output is a
+`frequencies.txt` feed per network, byte-compatible with the existing `gtfs_node_local` schema.
+
+# 1. Config — every assumption is a parameter here
+
+```{r config}
+cfg <- list(
+  grid_gpkg = "data/own/grid_network.gpkg",            # hand-drawn route + stop layers (exported from ArcGIS)
+  alllanes_geojson = "outputs/streets/street_grid.geojson",
+  signals_gpkg = "data/public/sdot/traffic_signals.gpkg",   # SDOT Traffic Signals (downloaded on first use)
+  crs_work  = 2926,                                       # NAD83(HARN) WA-N ftUS — all spatial work in feet
+
+  # ---- networks: which service types compose each feed ----
+  networks = list(
+    grid       = c("express", "frequent"),
+    grid_local = c("express", "frequent", "local")
+  ),
+
+  # ---- per service type ----
+  types = list(
+    express = list(route_layer = "Express_Routes",          stop_layer = "Express_Stops",
+                   prefix = "x_", rid = "EXP", agency_id = "GridExpress",
+                   color = "D43A3A", hw_day = 150, hw_night = 300),
+    frequent = list(route_layer = "Frequent_Routes_shorter", stop_layer = "Frequent_Stops_shorter",
+                   prefix = "f_", rid = "FRQ", agency_id = "GridFrequent",
+                   color = "2E6FDB", hw_day = 150, hw_night = 300),
+    local   = list(route_layer = "Local_Routes",            stop_layer = "Local_Stops",
+                   prefix = "l_", rid = "LOC", agency_id = "GridLocal",
+                   color = "8B4513", hw_day = 300, hw_night = 600)
+  ),
+
+  # ---- speed model (mph): class floor that posted/OSM speed can RAISE but never lower ----
+  art_min_mph      = 30,   # arterial floor (ARTCLASS 1/2/3)
+  res_min_mph      = 20,   # residential / non-arterial floor (incl. unmatched pieces)
+  cruise_factor    = 1.00, # multiply posted speed -> mid-block cruise (applied before the floor)
+
+  # ---- route->street join geometry ----
+  segmentize_ft    = 50,   # densify alignment to this spacing
+  match_buffer_ft  = 80,   # a street within this distance can claim a piece
+  bearing_tol_deg  = 35,   # and must be within this bearing (undirected)
+
+  # ---- dwell / stop penalty ----
+  signalized_types = c("CITY", "STATE"),  # INT_SIGNAL_TYPE_CD treated as full signals
+  signal_match_ft  = 150,  # stop within this of a full signal => "signalized"
+  dwell_signal_s   = 8,    # control delay at signalized stop WITH effective TSP
+  dwell_tsp_conflict_s = 15, # signalized but two perpendicular routes cross => TSP can't favor both
+  tsp_signal_buffer_ft = 100, # a route within this of a signal "uses" that signal
+  tsp_cross_min_deg    = 45,  # >= this bearing diff between two routes => crossing/perpendicular
+  through_signal_delay_s = 15, # delay for CROSSING a TSP-conflict signal w/o stopping (0 where TSP effective)
+  # non-signalized dwell = reentry_base_s + gap-acceptance d_re(q); q from SDOT/WSDOT count AADT
+  reentry_base_s     = 8,    # door + pull-out overhead before the merge wait
+  reentry_crit_gap_s = 6,    # critical gap a bus needs to merge back into the through lane (s)
+  peak_lane_fraction = 0.05, # AADT -> conflicting peak-hour merge-lane flow (~ K*D/lanes)
+  resid_aadt_floor   = 500,  # AADT assumed where no count is within range of the stop
+  reentry_max_s      = 30,   # cap on the gap-acceptance term
+  vol_match_ft       = 120,  # max stop->SDOT count-corridor distance to trust its AADT
+
+  # ---- vehicle (cutaway, NOT full bus) — m/s^2 ----
+  accel_a = 1.1,
+  decel_a = 1.5,
+
+  # ---- stop<->route assignment ----
+  stop_route_buffer_ft = 250,
+  min_stops_per_route  = 2,
+
+  # ---- calendar / service window ----
+  service_id = "WEEKDAY", days = c(1,1,1,1,1,0,0),
+  start_date = "20260101", end_date = "20261231", timezone = "America/Los_Angeles",
+  day_start = "05:00:00", day_end = "22:00:00", night_end = "29:00:00",
+
+  out_dir  = "outputs/grid_local",  # unzipped feed tables, one folder per feed
+  gtfs_out_dir = "outputs/gtfs", # feed .zips read by Phase2RunSimulation.Rmd
+  # ---- per-feed day(peak)/night headways (s); frequent emitted twice (high + standard) ----
+  hw_express_day    = 135, hw_express_night    = 270,   # express  2.25 min -> Grid
+  hw_express_gl_day = 120, hw_express_gl_night = 240,   # express  2.0  min -> Grid+Local
+  hw_frequent_day   = 140, hw_frequent_night   = 280,   # frequent 2.33 min -> Grid
+  hw_standard_day   = 200, hw_standard_night   = 400,   # frequent 3.33 min -> Grid+Local
+  hw_local_day      = 300, hw_local_night      = 600    # local    5    min -> Grid+Local
+)
+```
+
+# 2. Libraries + helpers
+
+```{r libs}
+suppressMessages({ library(sf); library(dplyr) })
+sf::sf_use_s2(FALSE)
+source("BusStopTimeModel.R")   # shared running-time + dwell model (helpers + gst_* functions)
+```
+
+# 3. Reference layers: streets (speed), lanes (capacity), signals
+
+```{r ref-layers}
+cfg  <- utils::modifyList(gst_default_params(), cfg)   # fill shared-model defaults (public data paths)
+refs <- gst_load_refs(cfg)   # streets(+street-grid), signals, OSM road classes, SDOT/WSDOT counts
+message(sprintf("refs: streets %d | %d full signals | %d SDOT count corridors (median AADT %.0f)",
+                nrow(refs$streets), nrow(refs$full_signals), nrow(refs$sdot_counts),
+                stats::median(refs$sdot_counts$aadt, na.rm = TRUE)))
+```
+
+# 4. Load routes + stops for every type
+
+```{r load-routes-stops}
+read_routes <- function(tname) {
+  tc <- cfg$types[[tname]]
+  g <- sf::st_read(cfg$grid_gpkg, layer = tc$route_layer, quiet = TRUE) |> sf::st_zm(drop = TRUE)
+  nm <- if ("Name" %in% names(g)) as.character(g[["Name"]]) else NA_character_
+  idx <- seq_len(nrow(g))
+  sf::st_sf(
+    type = tname,
+    rid  = sprintf("%s%03d", tc$rid, idx),
+    short_name = ifelse(is.na(nm), sprintf("%s%03d", tc$rid, idx), nm),
+    long_name  = paste0(tools::toTitleCase(tname), " ", ifelse(is.na(nm), idx, nm)),
+    geometry   = sf::st_geometry(g)
+  )
+}
+
+read_stops <- function(tname) {
+  tc <- cfg$types[[tname]]
+  g <- sf::st_read(cfg$grid_gpkg, layer = tc$stop_layer, quiet = TRUE) |> sf::st_zm(drop = TRUE)
+  g <- suppressWarnings(sf::st_cast(g, "POINT"))
+  base_id <- if ("stop_id" %in% names(g)) as.character(g[["stop_id"]]) else sprintf("%04d", seq_len(nrow(g)))
+  ll <- sf::st_coordinates(sf::st_transform(sf::st_geometry(g), 4326))
+  sf::st_sf(
+    type = tname,
+    stop_id = paste0(tc$prefix, base_id),
+    stop_name = paste0(tname, " ", base_id),
+    stop_lat = round(ll[, 2], 7), stop_lon = round(ll[, 1], 7),
+    geometry = sf::st_geometry(g)
+  )
+}
+
+all_types  <- names(cfg$types)
+routes_sf  <- do.call(rbind, lapply(all_types, read_routes))
+stops_sf   <- do.call(rbind, lapply(all_types, read_stops))
+message(sprintf("routes: %s", paste(sprintf("%s=%d", all_types,
+        tapply(routes_sf$rid, routes_sf$type, length)[all_types]), collapse = ", ")))
+```
+
+# 5. Densify every alignment into sub-segments (the join units)
+
+```{r subsegs}
+prepped <- gst_prep(routes_sf, refs, cfg)   # sub-segments (speed + merge gate) + TSP-conflict signals
+sub     <- prepped$sub
+sub_sf  <- prepped$sub_sf
+message(sprintf("sub-segments: %d (%.1f mi) | speed matched %.1f%% | merge-gated d0 %.1f%%",
+                nrow(sub), sum(sub$len_ft)/5280, 100*mean(sub$matched), 100*mean(sub$merge_d0)))
+```
+# 6. Speed join: each sub-segment -> nearest bearing-matching street segment
+
+# 7. Classify each stop as signalized (full signal within tolerance)
+
+```{r signal-classify}
+stops_sf      <- gst_classify_stops(stops_sf, prepped, refs, cfg)   # signalized / tsp_conflict / aadt / d_re / merge gate
+full_signals  <- prepped$full_signals       # carries $tsp_conflict (for the QA layer)
+conf_on_route <- prepped$conf_on_route
+ns <- !stops_sf$signalized
+message(sprintf("signals: %d full, %.1f%% TSP-conflict | stops: %.1f%% signalized, %.1f%% TSP-conflict",
+                nrow(full_signals), 100*mean(full_signals$tsp_conflict),
+                100*mean(stops_sf$signalized), 100*mean(stops_sf$tsp_conflict)))
+message(sprintf("non-sig re-entry (s): median %.1f | p90 %.1f | max %.1f; %.0f%% of non-sig stops gated to base",
+                stats::median(stops_sf$d_re[ns]), stats::quantile(stops_sf$d_re[ns], .9),
+                max(stops_sf$d_re[ns]), 100*mean(!stops_sf$merge_d0[ns])))
+```
+
+# 8. Per-route: order stops, integrate section times, build the template trip
+
+```{r per-route}
+
+build_route <- function(i) {
+  rid <- routes_sf$rid[i]; tname <- routes_sf$type[i]
+  cand <- stops_sf[stops_sf$type == tname, ]                       # candidates = stops of this type
+  res  <- gst_route_stop_times(rid, routes_sf[i, ], cand, prepped, cfg)
+  if (is.null(res)) return(NULL)
+  shp_ll <- sf::st_coordinates(sf::st_transform(
+    sf::st_sfc(lapply(seq_len(nrow(res$cc)), function(k) sf::st_point(c(res$cc$x[k], res$cc$y[k]))),
+               crs = cfg$crs_work), 4326))
+  list(
+    route = data.frame(route_id = rid, agency_id = cfg$types[[tname]]$agency_id,
+                       route_short_name = routes_sf$short_name[i], route_long_name = routes_sf$long_name[i],
+                       route_type = 3, route_color = cfg$types[[tname]]$color, route_text_color = "FFFFFF"),
+    trips = data.frame(route_id = rid, service_id = cfg$service_id,
+                       trip_id = paste0(rid, c("_d0","_d1")), shape_id = paste0("S", rid),
+                       direction_id = c(0,1)),
+    stop_times = rbind(res$st0, res$st1),
+    stops_used = res$stop_ids,
+    shape = data.frame(shape_id = paste0("S", rid),
+                       shape_pt_lat = round(shp_ll[, 2], 7),
+                       shape_pt_lon = round(shp_ll[, 1], 7),
+                       shape_pt_sequence = seq_len(nrow(res$cc))),
+    summary = data.frame(rid = rid, type = tname, n_stops = res$n_stops,
+                 length_mi = round(res$span_mi, 2), runtime_min = round(res$runtime_s/60, 1),
+                 mean_mph = round(res$span_mi / (res$runtime_s/3600), 1),
+                 pct_signalized = res$pct_signalized, n_tsp = res$n_tsp,
+                 n_gated = res$n_gated, n_thru = res$n_thru, mean_dwell_s = res$mean_dwell_s)
+  )
+}
+
+built <- lapply(seq_len(nrow(routes_sf)), build_route)
+built <- built[!vapply(built, is.null, logical(1))]
+route_summary <- do.call(rbind, lapply(built, `[[`, "summary"))
+route_summary$type_of <- routes_sf$type[match(route_summary$rid, routes_sf$rid)]
+print(route_summary)
+message(sprintf("built %d / %d routes | through-intersection (TSP-conflict, no-stop) delays added: %d crossings",
+                length(built), nrow(routes_sf), sum(route_summary$n_thru)))
+```
+
+# 9. Assemble each network's feed + write GTFS
+
+```{r write-feeds}
+# ---- per-type output feeds that Phase2RunSimulation consumes from data/gtfs/ ----
+# frequent routes are emitted TWICE: high-frequency `frequent` (Grid) + reduced `standard` (Grid+Local).
+OUTPUT_FEEDS <- list(
+  gtfs_grid_express    = list(types="express",  hw_day=cfg$hw_express_day,    hw_night=cfg$hw_express_night),    # Grid
+  gtfs_grid_express_gl = list(types="express",  hw_day=cfg$hw_express_gl_day, hw_night=cfg$hw_express_gl_night), # Grid+Local
+  gtfs_grid_frequent   = list(types="frequent", hw_day=cfg$hw_frequent_day,   hw_night=cfg$hw_frequent_night),
+  gtfs_grid_standard   = list(types="frequent", hw_day=cfg$hw_standard_day,   hw_night=cfg$hw_standard_night),
+  gtfs_grid_locals     = list(types="local",    hw_day=cfg$hw_local_day,      hw_night=cfg$hw_local_night)
+)
+NETWORK_FEEDS <- list(
+  grid       = c("gtfs_grid_express","gtfs_grid_frequent"),
+  grid_local = c("gtfs_grid_express_gl","gtfs_grid_standard","gtfs_grid_locals")
+)
+
+agency_tbl <- function(types_in) data.frame(
+  agency_id = vapply(cfg$types[types_in], `[[`, "", "agency_id"),
+  agency_name = paste0("Grid Network — ", tools::toTitleCase(types_in)),
+  agency_url = "https://example.org/grid-net", agency_timezone = cfg$timezone)
+
+calendar_tbl <- data.frame(service_id = cfg$service_id,
+  monday=cfg$days[1],tuesday=cfg$days[2],wednesday=cfg$days[3],thursday=cfg$days[4],
+  friday=cfg$days[5],saturday=cfg$days[6],sunday=cfg$days[7],
+  start_date=cfg$start_date, end_date=cfg$end_date)
+
+freq_tbl <- function(trips, hw_day, hw_night) do.call(rbind, lapply(trips$trip_id, function(tid)
+  data.frame(trip_id=tid, start_time=c(cfg$day_start, cfg$day_end), end_time=c(cfg$day_end, cfg$night_end),
+             headway_secs=c(hw_day, hw_night), exact_times=0)))
+
+write_pertype_feed <- function(feed_name, spec) {
+  types_in <- spec$types
+  keep <- vapply(built, function(b) routes_sf$type[match(b$route$route_id, routes_sf$rid)] %in% types_in, logical(1))
+  bb <- built[keep]
+  routes <- do.call(rbind, lapply(bb, `[[`, "route"))
+  trips  <- do.call(rbind, lapply(bb, `[[`, "trips"))
+  stop_times <- do.call(rbind, lapply(bb, `[[`, "stop_times"))
+  shapes <- do.call(rbind, lapply(bb, `[[`, "shape"))
+  used   <- unique(unlist(lapply(bb, `[[`, "stops_used")))
+  stops  <- stops_sf |> sf::st_drop_geometry() |> filter(stop_id %in% used) |>
+            distinct(stop_id, .keep_all = TRUE) |>
+            transmute(stop_id, stop_name, stop_lat, stop_lon)
+  freqs  <- freq_tbl(trips, spec$hw_day, spec$hw_night)
+
+  d <- file.path(cfg$out_dir, feed_name); dir.create(d, recursive = TRUE, showWarnings = FALSE)
+  wr <- function(df, f) utils::write.csv(df, file.path(d, f), row.names = FALSE, quote = FALSE)
+  wr(agency_tbl(types_in), "agency.txt"); wr(calendar_tbl, "calendar.txt")
+  wr(routes, "routes.txt"); wr(trips, "trips.txt"); wr(stop_times, "stop_times.txt")
+  wr(stops, "stops.txt"); wr(shapes, "shapes.txt"); wr(freqs, "frequencies.txt")
+  zipf <- file.path(cfg$gtfs_out_dir, paste0(feed_name, ".zip"))
+  files <- list.files(d, pattern = "\\.txt$", full.names = TRUE)
+  if (file.exists(zipf)) unlink(zipf)
+  if (requireNamespace("zip", quietly = TRUE)) zip::zipr(zipf, files)
+  else tryCatch(utils::zip(zipf, files, flags = "-j9X"), error = function(e) message("zip skipped"))
+  message(sprintf("[%s] %d routes, %d stops, %.2f-min day headway -> %s.zip",
+                  feed_name, nrow(routes), nrow(stops), spec$hw_day/60, file.path(cfg$gtfs_out_dir, feed_name)))
+  invisible(d)
+}
+
+dir.create(cfg$gtfs_out_dir, recursive = TRUE, showWarnings = FALSE)
+for (fn in names(OUTPUT_FEEDS)) write_pertype_feed(fn, OUTPUT_FEEDS[[fn]])
+
+# ---- Peak in-service buses (Table 9 method: freqs expanded, sweep_peak_concurrent per route, no layover) ----
+.sweep <- function(s, e){ ok<-is.finite(s)&is.finite(e)&e>s; s<-s[ok]; e<-e[ok]; n<-length(s); if(!n) return(0L)
+  ev<-data.frame(t=c(s,e), d=c(rep(1L,n),rep(-1L,n))); ev<-ev[order(ev$t,ev$d),]; as.integer(max(cumsum(ev$d))) }
+.h2s <- function(x){p<-do.call(rbind,strsplit(as.character(x),":")); as.integer(p[,1])*3600+as.integer(p[,2])*60+as.integer(p[,3])}
+feed_fleet <- function(spec){
+  keep <- vapply(built, function(b) routes_sf$type[match(b$route$route_id, routes_sf$rid)] %in% spec$types, logical(1))
+  bands <- list(c(.h2s(cfg$day_start), .h2s(cfg$day_end), spec$hw_day),
+                c(.h2s(cfg$day_end),   .h2s(cfg$night_end), spec$hw_night))
+  sum(vapply(built[keep], function(b){
+    st<-b$stop_times; st$arr<-.h2s(st$arrival_time); st$dep<-.h2s(st$departure_time)
+    ivs<-list()
+    for(tid in unique(st$trip_id)){ s<-st[st$trip_id==tid,]; D<-max(s$arr)-min(s$dep)
+      for(bd in bands){ if(bd[2]-bd[3] < bd[1]) next; ss<-seq(bd[1], bd[2]-bd[3], by=bd[3]); ivs[[length(ivs)+1]]<-cbind(ss, ss+D) } }
+    iv<-do.call(rbind, ivs); .sweep(iv[,1], iv[,2]) }, integer(1)))
+}
+fleet <- vapply(OUTPUT_FEEDS, feed_fleet, integer(1))
+cat("\nPeak in-service buses by feed:\n"); print(fleet)
+cat("\nBy network (Table 9 metric) vs target:\n")
+.tgt <- c(grid=1263, grid_local=1279)
+for (nm in names(NETWORK_FEEDS)) { tot <- sum(fleet[NETWORK_FEEDS[[nm]]])
+  cat(sprintf("  %-11s = %4d  (%+d vs %d)  [%s]\n", nm, tot, tot-.tgt[[nm]], .tgt[[nm]],
+      paste(sprintf("%s %d", sub("gtfs_grid_","",NETWORK_FEEDS[[nm]]), fleet[NETWORK_FEEDS[[nm]]]), collapse=" + "))) }
+```

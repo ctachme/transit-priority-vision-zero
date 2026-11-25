@@ -1,0 +1,3590 @@
+---
+title: "Node-based network: demand grid, corridors and local routes → GTFS"
+author: "Stephen Siciliano"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+params:
+  # ---- inputs ----
+  trips_tsv:            "data/public/soundcast/_trip.tsv"
+  parcel_map_csv:       "data/public/soundcast/parcel_2023_geography.csv"
+  link_gtfs_paths:
+    - "data/gtfs/other_agencies/40_gtfs.zip"
+    - "data/gtfs/other_agencies/96_gtfs.zip"
+  graph_rds:            "outputs/streets/drive_graph.rds"
+  # Hand-placed node locations (ArcGIS-snapped). Each point's geometry
+  # overrides the cell-centroid lat/lon for its `cell_id` (transit stations,
+  # major intersections).
+  snapped_stops_shp:    "data/own/node_stops/corridor_stops.shp"
+  # Transfer points (intersections / stations where buses can pick up extra
+  # transfers). Any candidate corridor whose road path passes within
+  # `transfer_buffer_ft` of one of these gets that point inserted as an
+  # automatic stop (the road geometry is NOT re-routed). Transfer points
+  # carry 0 demand but can act as hubs in transfer scoring.
+  transfer_points_shp:  "data/own/node_stops/transfer_points.shp"
+  frequent_stops_shp:   "data/own/node_stops/frequent_stops.shp"
+  local_stops_shp:      "data/own/node_stops/local_stops.shp"
+  # ---- outputs ----
+  out_dir:              "outputs/node_design"   # design tables, shapefiles, unzipped feeds
+  gtfs_out_dir:         "outputs/gtfs"          # gtfs_node_bus.zip, gtfs_node_local.zip (read by Phase 2)
+  pmedian_rds:          "outputs/node_design/pmedian_p12.rds"
+  grid_demand_rds:      "outputs/node_design/grid_demand_2640ft.rds"
+  corridor_design_rds:  "outputs/node_design/corridor_design.rds"
+  planar_crs:           2926          # WA State Plane North, US ft
+
+  # ---- Part 1: demand grid + p-median ----
+  cell_size_ft: 2640          # 0.5 mi in EPSG:2926 (US survey feet)
+  seattle_name: "Seattle"
+  city_col: "CityName"
+  origin_parcel_col: "opcl"
+  dest_parcel_col: "dpcl"
+  trips_weight_col: "trexpfac"
+  p_nodes: 12                  # total number of nodes (forced + free)
+  n_starts: 10                 # Teitz–Bart multi-start count
+  # cell_ids forced into the solution (Link station cells the network is
+  # anchored on). Use `!r integer(0)` for unconstrained.
+  forced_cell_ids: !r c(673L, 542L, 409L, 429L, 386L, 300L, 171L)
+
+  # ---- Part 2: rail + express-bus corridors ----
+  # Corridor enumeration (detour-bounded)
+  max_detour_ratio:       1.5    # corridor length ≤ this × direct A→B distance
+  max_corridor_nodes:     25       # max nodes per corridor including endpoints
+  n_bus_corridors:        20      # safety cap; greedy stops once every pair meets the quality threshold
+  # Quality-threshold scoring (time-based via dodgr_times — no bus_speed needed)
+  transfer_penalty_min:   1     # min penalty added to via-transfer travel time
+  express_dwell_sec:      30      # seconds added at every express stop (routing + GTFS export)
+  quality_threshold_pct:  0.33     # pair "served" if T_service ≤ (1 + this) × T_direct_road
+  # Each node is a "catchment" of this radius: buses can enter/exit via ANY
+  # graph vertex within `node_buffer_ft` of the canonical node point. Fixes
+  # one-way-street inefficiencies where a single snapped vertex forces
+  # routes to loop around blocks. Use 0 to revert to single-vertex snap.
+  node_buffer_ft:         400
+  unreachable_quality:    5       # quality assigned to a pair with no path (caps the penalty)
+  # ILP rightsizing: each node's service-share (corridors touching it / total)
+  # must be ≤ rightsize_tolerance × demand-share. 2 means a node with 10% of
+  # demand gets ≤ 20% of corridors. Acts as an upper bound only.
+  rightsize_tolerance:    4
+  transfer_buffer_ft:     400
+  # Rail routes to include, by route_id. Streetcars (SLU/FHS) are excluded
+  # on purpose — they're slow enough that treating them as line-haul rail
+  # would distort the corridor design. Sounder (N/S Line) is peak-only so
+  # also out. Monorail is in because it functions like a short rail link
+  # between Westlake (Link) and Seattle Center.
+  #   100479 = Link 1 Line       (Sound Transit, 40_gtfs.zip)
+  #   2LINE  = Link 2 Line       (Sound Transit, 40_gtfs.zip)
+  #   SCM    = Seattle Monorail  (Seattle Center, 96_gtfs.zip)
+  link_route_ids: ["100479", "2LINE", "SCM"]
+  # Typical weekday used to pick a service pattern for travel times.
+  # Feed validity: 2026-03-29 to 2026-08-28 (Spring 2026 Sound Transit feed).
+  service_date:          "2026-05-13"   # Wednesday in the feed's stable period
+  # Midday window for averaging interstation travel times (HH:MM:SS).
+  tt_window_start:       "10:00:00"
+  tt_window_end:         "14:00:00"
+
+  # ---- Part 3: local feeder routes ----
+  # Coverage / routing knobs
+  walk_dist_ft:        880      # a stop is "served" (walkshed coverage, for selection) if within this of a route's path
+  on_route_buffer_ft:  150      # a covered stop is an actual BUS STOP (dwell + in GTFS/shp) only if within this of the path; farther = walkshed-served, rider walks
+  residential_penalty: 1        # edge-weight multiplier for residential/service/living_street
+  dual_assign_ratio:   1.33     # also assign a stop to a 2nd node if within this × nearest time
+  pair_bearing_tol:    60       # deg; pair spokes whose bearings are within this of opposite
+  # --- Travel-time selection (assignment ILP) ---
+  node_on_route_buffer_ft: 660  # a node counts as "on" a route (a transfer point) if within this of its path
+  lambda_fleet:            6    # objective weight on buses (LOWER => more buses). Tuned to ~1263 node Table-9 fleet under the shared-model timing (sweep: λ=4→1353, λ=6→1244 node)
+  local_served_reward:     25   # reward (rider-minutes) for serving an optional local stop; served if its trip cost < this
+  express_transfer_min:    2    # wait penalty when transferring local->express (skipped when the route reaches the destination node directly)
+  # --- Export (GTFS + shapefile) ---
+  local_dwell_sec:         20   # seconds dwell at each local stop
+  bus_speed_mph:           30   # local-bus cruise speed between stops
+  local_day_headway_min:   5    # 06:00–22:00 peak headway (drives ILP bus weights + fleet)
+  local_night_headway_min: 10   # 22:00–01:00 headway
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+suppressPackageStartupMessages({
+  library(DBI)
+  library(duckdb)
+  library(data.table)
+  library(dplyr)
+  library(sf)
+  library(tigris)
+  library(scales)
+  library(tidyr)
+  library(dodgr)
+  library(lwgeom)
+})
+
+options(tigris_use_cache = TRUE)
+dir.create(params$out_dir,      showWarnings = FALSE, recursive = TRUE)
+dir.create(params$gtfs_out_dir, showWarnings = FALSE, recursive = TRUE)
+source("BusStopTimeModel.R")   # shared street-derived stop-time model (same as the grid network)
+```
+
+Designs the node-based network and writes its two GTFS feeds:
+
+1. **Demand grid and p-median nodes** — a half-mile cell grid over Seattle loaded
+   with SoundCast/DaySim trip origins and destinations; a p-median model picks 12
+   nodes (7 anchored on Link stations).
+2. **Rail and express-bus corridors** — the Link and Monorail lines from the
+   Spring 2026 feeds, plus express-bus corridors between nodes chosen by an
+   integer program; written to `gtfs_node_bus.zip`.
+3. **Local feeder routes** — local routes that bring every frequent and local stop
+   to a node, chosen by an assignment integer program; written to
+   `gtfs_node_local.zip`.
+
+Design tables and shapefiles go to `outputs/node_design/`; the feeds go to
+`outputs/gtfs/`.
+
+# Part 1 — Demand grid and p-median nodes
+
+### Goal
+
+Build the inputs for the node-based network design:
+
+1. A regular 0.5 mi × 0.5 mi grid over Seattle (candidate node locations).
+2. A demand value per cell = sum of trips that originate or end at a parcel
+   in that cell, weighted by `trexpfac`.
+3. Select `p_nodes` node locations via p-median, optionally **forcing** a
+   set of cell IDs to be in the solution (used to snap nodes onto existing
+   Link station cells).
+
+Each PSRC trip contributes up to 2 endpoint-trips to the demand surface
+(1 if only one end is in Seattle, 2 if it is wholly intra-Seattle).
+
+### Load parcel geography
+
+Parcel CSV has a WKT `geometry` column in EPSG:2926. We promote to `sf`
+and filter to Seattle parcels (cells outside Seattle aren't candidate
+node locations).
+
+```{r load-parcels}
+parcel_dt <- fread(params$parcel_map_csv)
+parcel_dt[, ParcelID := as.character(ParcelID)]
+
+parcel_sf <- st_as_sf(parcel_dt, wkt = "geometry", crs = params$planar_crs)
+
+parcel_seattle_sf <- parcel_sf %>%
+  filter(.data[[params$city_col]] == params$seattle_name)
+
+cat("Seattle parcels:", nrow(parcel_seattle_sf), "\n")
+```
+
+### Seattle boundary
+
+```{r seattle-boundary}
+seattle_place <- tigris::places(state = "WA", year = 2020, class = "sf") %>%
+  filter(NAME == params$seattle_name) %>%
+  st_transform(params$planar_crs) %>%
+  st_union() %>%
+  st_make_valid()
+```
+
+### Build the cell grid
+
+A regular square grid over the Seattle bbox, then keep only cells that
+intersect the city boundary. Cell IDs are sequential and stable for a
+given bbox + cellsize.
+
+```{r build-grid}
+grid_full <- st_make_grid(
+  seattle_place,
+  cellsize = params$cell_size_ft,
+  square   = TRUE
+) %>%
+  st_sf(cell_id = seq_along(.))
+
+grid <- grid_full %>%
+  filter(lengths(st_intersects(., seattle_place)) > 0)
+
+cat("Cells covering Seattle:", nrow(grid),
+    sprintf(" (%.1f mi cellsize)\n", params$cell_size_ft / 5280))
+```
+
+### Assign parcels to cells
+
+Spatial join: each Seattle parcel gets the `cell_id` of the cell it falls in.
+Points on cell boundaries (rare) can match more than one cell — we keep the first.
+
+```{r parcel-cell-join}
+parcel_cell <- parcel_seattle_sf %>%
+  st_join(grid, join = st_intersects) %>%
+  st_drop_geometry() %>%
+  select(ParcelID, cell_id) %>%
+  filter(!is.na(cell_id)) %>%
+  distinct(ParcelID, .keep_all = TRUE)
+
+parcels_per_cell <- parcel_cell %>%
+  count(cell_id, name = "n_parcels")
+
+summary(parcels_per_cell$n_parcels)
+```
+
+### Aggregate trips to cells
+
+```{r duckdb-trips}
+con <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+dbExecute(con, "PRAGMA threads=12;")
+
+dbWriteTable(con, "parcel_cell", parcel_cell, overwrite = TRUE)
+dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_pc_parcelid ON parcel_cell(ParcelID);")
+
+trips_path <- normalizePath(params$trips_tsv, winslash = "/", mustWork = TRUE)
+trips_rel  <- sprintf(
+  "read_csv_auto('%s', delim='\\t', header=true, quote='\"', escape='\"')",
+  trips_path
+)
+
+wt_col     <- params$trips_weight_col
+origin_col <- params$origin_parcel_col
+dest_col   <- params$dest_parcel_col
+
+sql_origin <- sprintf("
+  SELECT pc.cell_id AS cell_id,
+         SUM(COALESCE(CAST(t.%s AS DOUBLE), 0.0)) AS origin_trips
+  FROM %s t
+  JOIN parcel_cell pc
+    ON CAST(t.%s AS VARCHAR) = pc.ParcelID
+  GROUP BY 1
+", wt_col, trips_rel, origin_col)
+
+sql_dest <- sprintf("
+  SELECT pc.cell_id AS cell_id,
+         SUM(COALESCE(CAST(t.%s AS DOUBLE), 0.0)) AS dest_trips
+  FROM %s t
+  JOIN parcel_cell pc
+    ON CAST(t.%s AS VARCHAR) = pc.ParcelID
+  GROUP BY 1
+", wt_col, trips_rel, dest_col)
+
+origin_demand <- dbGetQuery(con, sql_origin)
+dest_demand   <- dbGetQuery(con, sql_dest)
+
+dbDisconnect(con, shutdown = TRUE)
+
+cell_demand <- full_join(origin_demand, dest_demand, by = "cell_id") %>%
+  mutate(
+    origin_trips = coalesce(origin_trips, 0),
+    dest_trips   = coalesce(dest_trips,   0),
+    total_demand = origin_trips + dest_trips
+  )
+
+grid_demand <- grid %>%
+  left_join(cell_demand, by = "cell_id") %>%
+  mutate(
+    origin_trips = coalesce(origin_trips, 0),
+    dest_trips   = coalesce(dest_trips,   0),
+    total_demand = coalesce(total_demand, 0)
+  )
+
+summary(grid_demand$total_demand)
+```
+
+### Save the demand grid
+
+```{r save-grid}
+saveRDS(
+  grid_demand,
+  file.path(params$out_dir, sprintf("grid_demand_%dft.rds", params$cell_size_ft))
+)
+fwrite(
+  st_drop_geometry(grid_demand),
+  file.path(params$out_dir, sprintf("grid_demand_%dft.csv", params$cell_size_ft))
+)
+```
+
+## p-median node selection (with optional forced facilities)
+
+We pick `p_nodes` cell locations to act as transit nodes. Some cells may be
+**forced** into the solution (passed via `params$forced_cell_ids`) — used
+here to snap nodes onto existing Link station cells. The remaining
+`p_nodes - length(forced)` facility slots are optimized freely.
+
+- **Demand points** = all cell centroids, weighted by `total_demand`.
+- **Candidates for free slots** = all cells *not* already forced.
+- **Distance** = Euclidean between centroids (EPSG:2926 → miles).
+- **Objective**: minimize Σᵢ wᵢ · dᵢ, where dᵢ is the distance from cell i
+  to its nearest selected node.
+
+Solved with a **Teitz–Bart interchange heuristic** that swaps only the
+free facility slots; forced slots stay pinned across iterations.
+
+### Inputs
+
+```{r pmedian-inputs}
+centroids <- st_centroid(grid_demand)
+coords_ft <- st_coordinates(centroids)
+
+D_mi <- as.matrix(dist(coords_ft)) / 5280
+w    <- as.numeric(grid_demand$total_demand)
+n    <- length(w)
+
+cat(sprintf("Distance matrix: %d x %d cells\n", n, n))
+cat(sprintf("Weight range: %s — %s trips\n",
+            format(round(min(w)), big.mark = ","),
+            format(round(max(w)), big.mark = ",")))
+```
+
+### Teitz–Bart heuristic with forced facilities
+
+```{r pmedian-solver}
+pmed_cost <- function(facs, D, w) {
+  if (length(facs) == 1L) {
+    nearest_d <- D[, facs]
+  } else {
+    nearest_d <- matrixStats::rowMins(D[, facs, drop = FALSE])
+  }
+  sum(w * nearest_d)
+}
+
+# Teitz–Bart interchange, multi-start, with support for forced facilities.
+# `forced` is an integer vector of row indices into D (NOT cell_ids).
+# Those indices are guaranteed to appear in every candidate solution; only
+# the remaining (p - length(forced)) slots are eligible for swaps.
+tb_pmedian <- function(D, w, p, forced = integer(0),
+                       n_starts = 15, seed = 42, verbose = TRUE) {
+  if (!requireNamespace("matrixStats", quietly = TRUE)) {
+    stop("Install matrixStats: install.packages('matrixStats')")
+  }
+  set.seed(seed)
+  n <- nrow(D)
+
+  forced <- unique(as.integer(forced))
+  if (length(forced) > p) {
+    stop(sprintf("Asked for p=%d nodes but %d facilities are forced.",
+                 p, length(forced)))
+  }
+  free_p           <- p - length(forced)
+  free_candidates  <- setdiff(seq_len(n), forced)
+
+  if (free_p == 0L) {
+    # Edge case: every slot is forced. Just return.
+    return(list(facilities = sort(forced),
+                cost       = pmed_cost(forced, D, w),
+                start      = 0L,
+                forced     = forced))
+  }
+
+  best <- NULL
+  for (s in seq_len(n_starts)) {
+    # Weighted random seed for the free slots (high-demand cells more likely)
+    init_probs   <- pmax(w[free_candidates], 1e-6)
+    free_init    <- sample(free_candidates, free_p, prob = init_probs)
+    selected     <- c(forced, free_init)
+    cur_cost     <- pmed_cost(selected, D, w)
+
+    # Free slots are positions (length(forced)+1) .. p in `selected`
+    free_slots <- seq_len(free_p) + length(forced)
+
+    repeat {
+      improved <- FALSE
+      for (i_idx in free_slots) {
+        for (j in setdiff(free_candidates, selected)) {
+          candidate          <- selected
+          candidate[i_idx]   <- j
+          c_new              <- pmed_cost(candidate, D, w)
+          if (c_new < cur_cost - 1e-9) {
+            selected <- candidate
+            cur_cost <- c_new
+            improved <- TRUE
+            break
+          }
+        }
+        if (improved) break
+      }
+      if (!improved) break
+    }
+
+    if (is.null(best) || cur_cost < best$cost) {
+      best <- list(facilities = sort(selected),
+                   cost       = cur_cost,
+                   start      = s,
+                   forced     = forced)
+    }
+    if (verbose) {
+      cat(sprintf("  start %2d: cost = %s  (best so far: %s)\n",
+                  s,
+                  format(round(cur_cost), big.mark = ","),
+                  format(round(best$cost), big.mark = ",")))
+    }
+  }
+  best
+}
+```
+
+### Translate forced cell IDs to row indices
+
+The user passes `forced_cell_ids` in terms of `cell_id` (what shows up on
+the maps). The optimizer works on row indices in `grid_demand` / `D_mi`,
+so we look them up here and bail loudly if any aren't found.
+
+```{r pmedian-forced}
+forced_cell_ids <- as.integer(params$forced_cell_ids)
+if (length(forced_cell_ids) == 0L) {
+  forced_indices <- integer(0)
+  cat("No forced cells — running unconstrained p-median.\n")
+} else {
+  forced_indices <- match(forced_cell_ids, grid_demand$cell_id)
+  if (any(is.na(forced_indices))) {
+    bad <- forced_cell_ids[is.na(forced_indices)]
+    stop("Forced cell_ids not present in grid: ",
+         paste(bad, collapse = ", "))
+  }
+  forced_in_seattle <- grid_demand[forced_indices, ] %>%
+    st_drop_geometry() %>%
+    select(cell_id, origin_trips, dest_trips, total_demand)
+  cat(sprintf("Forced %d cells (free slots: %d):\n",
+              length(forced_indices), params$p_nodes - length(forced_indices)))
+  print(forced_in_seattle)
+}
+```
+
+### Run
+
+```{r pmedian-run}
+t0  <- Sys.time()
+res <- tb_pmedian(D_mi, w,
+                  p        = params$p_nodes,
+                  forced   = forced_indices,
+                  n_starts = params$n_starts)
+t1  <- Sys.time()
+
+cat(sprintf("\nBest cost: %s demand-miles  (in %.1f s)\n",
+            format(round(res$cost), big.mark = ","),
+            as.numeric(t1 - t0, units = "secs")))
+cat("Best start index:", res$start, "\n")
+
+selected_cell_ids <- grid_demand$cell_id[res$facilities]
+forced_cell_ids_chosen <- grid_demand$cell_id[res$forced]
+
+cat("\nForced cell IDs (always in solution):\n")
+print(forced_cell_ids_chosen)
+cat("\nAll selected cell IDs:\n")
+print(selected_cell_ids)
+```
+
+### How many nodes? Coverage by node count
+
+The node count was chosen from an unconstrained p-median sweep (no forced
+cells): demand-weighted mean distance to the nearest node and the share of
+demand within 0.25 and 0.5 miles of a node, for 6 to 16 nodes. Improvement
+falls below 10% per step beyond 12 nodes (thesis Table 8).
+
+```{r pmedian-node-count-sweep}
+pmed_metrics <- function(facilities, D, w) {
+  d <- apply(D[, facilities, drop = FALSE], 1, min)
+  c(weighted_avg_mi = sum(w * d) / sum(w),
+    pct_within_0_25 = 100 * sum(w * (d <= 0.25)) / sum(w),
+    pct_within_0_5  = 100 * sum(w * (d <= 0.5))  / sum(w))
+}
+sweep <- do.call(rbind, lapply(seq(6, 16, by = 2), function(p) {
+  r <- tb_pmedian(D_mi, w, p = p, n_starts = params$n_starts, verbose = FALSE)
+  data.frame(p = p, t(pmed_metrics(r$facilities, D_mi, w)))
+}))
+fwrite(sweep, file.path(params$out_dir, "pmedian_sensitivity.csv"))
+sweep
+```
+
+### Assignment of every cell to its nearest node
+
+```{r pmedian-assignment}
+D_sub <- D_mi[, res$facilities, drop = FALSE]
+
+nearest_idx <- if (params$p_nodes == 1L) {
+  rep(1L, n)
+} else {
+  max.col(-D_sub, ties.method = "first")
+}
+
+nearest_dist_mi <- D_sub[cbind(seq_len(n), nearest_idx)]
+nearest_cell_id <- grid_demand$cell_id[res$facilities[nearest_idx]]
+
+grid_demand <- grid_demand %>%
+  mutate(
+    assigned_node   = nearest_cell_id,
+    dist_to_node_mi = nearest_dist_mi,
+    is_node         = cell_id %in% selected_cell_ids,
+    is_forced_node  = cell_id %in% forced_cell_ids_chosen
+  )
+
+weighted_avg_mi <- with(
+  grid_demand,
+  sum(total_demand * dist_to_node_mi) / sum(total_demand)
+)
+cat(sprintf("Demand-weighted avg distance to nearest node: %.2f mi\n",
+            weighted_avg_mi))
+cat(sprintf("Share of demand within 0.5 mi of a node: %.1f%%\n",
+            100 * with(grid_demand,
+                       sum(total_demand * (dist_to_node_mi <= 0.5)) /
+                         sum(total_demand))))
+```
+
+### Save results
+
+```{r pmedian-save}
+nodes_df <- grid_demand %>%
+  st_drop_geometry() %>%
+  filter(is_node) %>%
+  select(cell_id, origin_trips, dest_trips, total_demand, is_forced_node) %>%
+  arrange(desc(total_demand))
+
+assignment_df <- grid_demand %>%
+  st_drop_geometry() %>%
+  select(cell_id, total_demand, assigned_node, dist_to_node_mi,
+         is_node, is_forced_node)
+
+saveRDS(
+  list(
+    p              = params$p_nodes,
+    n_forced       = length(forced_indices),
+    forced_cell_ids = forced_cell_ids_chosen,
+    nodes          = nodes_df,
+    assignment     = assignment_df,
+    cost           = res$cost,
+    metrics        = pmed_metrics(res$facilities, D_mi, w),
+    n_starts       = params$n_starts,
+    cell_size_ft   = params$cell_size_ft
+  ),
+  file.path(params$out_dir, sprintf("pmedian_p%d.rds", params$p_nodes))
+)
+
+fwrite(nodes_df,
+       file.path(params$out_dir,
+                 sprintf("pmedian_p%d_nodes.csv", params$p_nodes)))
+fwrite(assignment_df,
+       file.path(params$out_dir,
+                 sprintf("pmedian_p%d_assignment.csv", params$p_nodes)))
+
+nodes_df
+```
+
+# Part 2 — Rail and express-bus corridors
+
+### Goal
+
+Identify the **Link corridor** as an ordered sequence of cell IDs (with
+interstation travel times in seconds), so step 3 (greedy set cover) can
+treat it as a pre-existing line and design the bus corridor set to
+**complement** it rather than parallel it.
+
+Outputs of this step: `outputs/node_design/rail_corridors.rds` (ordered cells along
+each rail line with interstation travel times), plus `rail_corridor_cells.csv` and
+`rail_interstation_times.csv`.
+
+### GTFS helpers
+
+We need to read individual GTFS members without unpacking the whole feed,
+since the r5 directory may have multiple agency feeds.
+
+```{r gtfs-helpers}
+
+read_gtfs_member <- function(zipfile, member) {
+  members <- tryCatch(utils::unzip(zipfile, list = TRUE)$Name, error = function(e) character())
+  if (!(member %in% members)) return(NULL)
+
+  td <- tempfile("gtfs_")
+  dir.create(td)
+  utils::unzip(zipfile, files = member, exdir = td)
+  out <- data.table::fread(file.path(td, member), na.strings = c("", "NA"))
+  unlink(td, recursive = TRUE, force = TRUE)
+  out
+}
+
+active_service_ids <- function(zipfile, service_date) {
+  service_date <- as.Date(service_date)
+  ymd <- format(service_date, "%Y%m%d")
+  dow <- tolower(weekdays(service_date))
+
+  cal  <- read_gtfs_member(zipfile, "calendar.txt")
+  cdat <- read_gtfs_member(zipfile, "calendar_dates.txt")
+
+  active <- character()
+  if (!is.null(cal) && nrow(cal) > 0) {
+    cal <- as.data.table(cal)
+    if (dow %in% names(cal)) {
+      base_active <- cal[
+        get(dow) == 1 &
+          as.character(start_date) <= ymd &
+          as.character(end_date)   >= ymd,
+        unique(as.character(service_id))
+      ]
+      active <- union(active, base_active)
+    }
+  }
+  if (!is.null(cdat) && nrow(cdat) > 0) {
+    cdat <- as.data.table(cdat)
+    added   <- cdat[as.character(date) == ymd & exception_type == 1,
+                    unique(as.character(service_id))]
+    removed <- cdat[as.character(date) == ymd & exception_type == 2,
+                    unique(as.character(service_id))]
+    active  <- setdiff(union(active, added), removed)
+  }
+  unique(active)
+}
+
+time_to_sec <- function(hms) {
+  # Handles GTFS times > 24:00:00 (i.e., after midnight on the service day)
+  parts <- strsplit(as.character(hms), ":", fixed = TRUE)
+  vapply(parts, function(p) {
+    if (length(p) < 3 || any(is.na(p))) return(NA_real_)
+    as.numeric(p[1]) * 3600 + as.numeric(p[2]) * 60 + as.numeric(p[3])
+  }, numeric(1))
+}
+```
+
+### Load GTFS feeds
+
+Multiple feeds supported — Sound Transit (`40_gtfs.zip`) for Link 1/2 Line,
+Seattle Center Monorail (`96_gtfs.zip`) for the Monorail.
+
+```{r discover-feeds}
+gtfs_zips <- vapply(
+  params$link_gtfs_paths,
+  function(p) normalizePath(p, winslash = "/", mustWork = TRUE),
+  character(1)
+)
+data.frame(feed = basename(gtfs_zips), path = gtfs_zips)
+```
+
+### Identify rail routes by route_id
+
+We filter by `route_id` (not `route_short_name`) so the three lines resolve
+unambiguously across feeds, regardless of how each agency labels them.
+
+```{r identify-rail-routes}
+target_ids <- as.character(params$link_route_ids)
+
+rail_routes <- bind_rows(lapply(gtfs_zips, function(z) {
+  routes <- read_gtfs_member(z, "routes.txt")
+  if (is.null(routes)) return(NULL)
+  routes <- as.data.table(routes)
+  routes[, route_id := as.character(route_id)]
+  matched <- routes[route_id %in% target_ids]
+  if (nrow(matched) == 0L) return(NULL)
+  matched[, feed := basename(z)]
+  out_cols <- intersect(
+    c("feed", "route_id", "route_short_name", "route_long_name",
+      "route_type", "route_color"),
+    names(matched)
+  )
+  matched[, ..out_cols]
+}))
+
+missing <- setdiff(target_ids, rail_routes$route_id)
+if (length(missing) > 0L) {
+  stop("Requested route_ids not found in any feed: ",
+       paste(missing, collapse = ", "))
+}
+
+rail_routes
+```
+
+### Process a single rail route
+
+For one `route_id`, do everything: pull active trips on the service date,
+get stops with lat/lon, spatial-join to cells, compute midday interstation
+travel times, build the Seattle-internal corridor sequence (the trip
+visiting the most Seattle stops), and collapse runs of stations that
+share the same 0.5 mi cell.
+
+```{r process-rail-route-fn}
+process_rail_route <- function(route_id, zipfile, service_date,
+                               grid_cells, planar_crs,
+                               tt_window_start, tt_window_end) {
+  rid <- as.character(route_id)
+
+  routes <- read_gtfs_member(zipfile, "routes.txt")     %>% as.data.table()
+  trips  <- read_gtfs_member(zipfile, "trips.txt")      %>% as.data.table()
+  stops  <- read_gtfs_member(zipfile, "stops.txt")      %>% as.data.table()
+  st     <- read_gtfs_member(zipfile, "stop_times.txt") %>% as.data.table()
+
+  routes[, route_id := as.character(route_id)]
+  trips [, route_id := as.character(route_id)]
+  trips [, trip_id  := as.character(trip_id)]
+  st    [, trip_id  := as.character(trip_id)]
+  st    [, stop_id  := as.character(stop_id)]
+  stops [, stop_id  := as.character(stop_id)]
+
+  route_info <- routes[route_id == rid]
+  stopifnot(nrow(route_info) >= 1L)
+
+  svc_ids     <- active_service_ids(zipfile, service_date)
+  route_trips <- trips[route_id == rid & as.character(service_id) %in% svc_ids]
+  if (nrow(route_trips) == 0L) {
+    warning("No active trips for route_id ", rid, " on ", service_date)
+    return(NULL)
+  }
+  route_st <- st[trip_id %in% route_trips$trip_id]
+
+  # Unique stops with one row per stop_id (parent stations + platforms can duplicate)
+  route_stops_unique <- stops[stop_id %in% unique(route_st$stop_id),
+    .(stop_name = first(na.omit(stop_name)),
+      stop_lat  = mean(as.numeric(stop_lat), na.rm = TRUE),
+      stop_lon  = mean(as.numeric(stop_lon), na.rm = TRUE)),
+    by = stop_id
+  ][!is.na(stop_lat) & !is.na(stop_lon)]
+
+  stops_sf <- st_as_sf(
+    route_stops_unique,
+    coords = c("stop_lon", "stop_lat"),
+    crs    = 4326
+  ) %>% st_transform(planar_crs)
+
+  stops_sf <- stops_sf %>%
+    st_join(grid_cells %>% select(cell_id), join = st_intersects) %>%
+    mutate(in_seattle_grid = !is.na(cell_id))
+
+  # Midday interstation segment times (averaged across trips in the window)
+  route_st[, arr_sec := time_to_sec(arrival_time)]
+  route_st[, dep_sec := time_to_sec(departure_time)]
+  trip_start <- route_st[, .(start_sec = min(dep_sec, na.rm = TRUE)),
+                          by = trip_id]
+  mid_lo <- time_to_sec(tt_window_start)
+  mid_hi <- time_to_sec(tt_window_end)
+  midday_trips <- trip_start[start_sec >= mid_lo & start_sec <= mid_hi, trip_id]
+  if (length(midday_trips) == 0L) midday_trips <- unique(route_st$trip_id)
+
+  mid_st <- route_st[trip_id %in% midday_trips]
+  setorder(mid_st, trip_id, stop_sequence)
+  mid_st[, next_stop_id := shift(stop_id, type = "lead"), by = trip_id]
+  mid_st[, next_arr_sec := shift(arr_sec, type = "lead"), by = trip_id]
+  mid_st[, dt_sec       := next_arr_sec - dep_sec]
+
+  seg_times <- mid_st[!is.na(next_stop_id) & !is.na(dt_sec) & dt_sec > 0,
+                      .(seg_sec_mean   = mean(dt_sec),
+                        seg_sec_median = median(dt_sec),
+                        n_trips        = .N),
+                      by = .(from_stop = stop_id, to_stop = next_stop_id)]
+
+  # Canonical Seattle-internal sequence: pick the trip visiting the most
+  # Seattle-grid stops, use its stop_sequence ordering.
+  seattle_stop_ids <- stops_sf %>% st_drop_geometry() %>%
+    filter(in_seattle_grid) %>% pull(stop_id)
+  if (length(seattle_stop_ids) == 0L) {
+    warning("Route ", rid, " has no stops in the Seattle grid.")
+    return(NULL)
+  }
+  trip_cov <- mid_st[stop_id %in% seattle_stop_ids,
+                     .(n = uniqueN(stop_id)),
+                     by = trip_id][order(-n)]
+  canonical_trip <- trip_cov$trip_id[1]
+
+  canonical_seq <- mid_st[
+    trip_id == canonical_trip & stop_id %in% seattle_stop_ids,
+    .(stop_id, stop_sequence, arr_sec, dep_sec)
+  ][order(stop_sequence)] %>%
+    left_join(
+      stops_sf %>% st_drop_geometry() %>%
+        filter(in_seattle_grid) %>%
+        select(stop_id, stop_name, cell_id),
+      by = "stop_id"
+    )
+
+  # Collapse runs of same-cell consecutive stations into single corridor entries
+  corridor_cells <- canonical_seq %>%
+    filter(!is.na(cell_id)) %>%
+    mutate(run_id = cumsum(cell_id != lag(cell_id, default = -1L))) %>%
+    group_by(run_id) %>%
+    summarize(
+      cell_id     = first(cell_id),
+      stop_ids    = paste(stop_id, collapse = "|"),
+      stop_names  = paste(unique(stop_name), collapse = " / "),
+      arr_sec_in  = first(arr_sec),
+      dep_sec_out = last(dep_sec),
+      .groups     = "drop"
+    ) %>%
+    arrange(run_id) %>%
+    mutate(
+      corridor_pos   = row_number(),
+      next_cell_id   = lead(cell_id),
+      dt_to_next_sec = lead(arr_sec_in) - dep_sec_out
+    )
+
+  list(
+    route_id          = rid,
+    route_short_name  = as.character(route_info$route_short_name[1]),
+    route_long_name   = if ("route_long_name" %in% names(route_info))
+                          as.character(route_info$route_long_name[1])
+                        else NA_character_,
+    route_color_hex   = if ("route_color" %in% names(route_info) &&
+                            !is.na(route_info$route_color[1]) &&
+                            nzchar(route_info$route_color[1]))
+                          paste0("#", as.character(route_info$route_color[1]))
+                        else NA_character_,
+    feed              = basename(zipfile),
+    stops_sf          = stops_sf,
+    seg_times         = seg_times,
+    corridor_cells    = corridor_cells
+  )
+}
+```
+
+### Build the list of rail corridors
+
+We need the grid + p-median outputs in scope for the spatial join and
+overlap flagging — load once, share across all rail routes.
+
+```{r build-rail-corridors}
+grid_demand <- readRDS(params$grid_demand_rds)
+pmed        <- readRDS(params$pmedian_rds)
+node_cell_ids <- pmed$nodes$cell_id
+
+rail_corridors <- lapply(target_ids, function(rid) {
+  feed_basename <- rail_routes[route_id == rid, feed][1]
+  zipfile       <- gtfs_zips[basename(gtfs_zips) == feed_basename][1]
+  process_rail_route(
+    route_id        = rid,
+    zipfile         = zipfile,
+    service_date    = params$service_date,
+    grid_cells      = grid_demand,
+    planar_crs      = params$planar_crs,
+    tt_window_start = params$tt_window_start,
+    tt_window_end   = params$tt_window_end
+  )
+})
+names(rail_corridors) <- target_ids
+rail_corridors <- rail_corridors[!vapply(rail_corridors, is.null, logical(1))]
+
+# Inspect per-route
+for (rc in rail_corridors) {
+  n_sea <- nrow(rc$stops_sf %>% st_drop_geometry() %>% filter(in_seattle_grid))
+  cat(sprintf("\n--- %s (route_id=%s, feed=%s) — %d Seattle stations in %d cells ---\n",
+              rc$route_short_name, rc$route_id, rc$feed,
+              n_sea, nrow(rc$corridor_cells)))
+  print(rc$corridor_cells %>%
+          select(corridor_pos, cell_id, stop_names, dt_to_next_sec))
+}
+```
+
+### Flag p-median overlap per rail line
+
+```{r rail-pmedian-overlap}
+for (i in seq_along(rail_corridors)) {
+  rail_corridors[[i]]$corridor_cells <- rail_corridors[[i]]$corridor_cells %>%
+    mutate(is_pmedian_node = cell_id %in% node_cell_ids)
+}
+
+overlap_summary <- bind_rows(lapply(rail_corridors, function(rc) {
+  rc$corridor_cells %>%
+    filter(is_pmedian_node) %>%
+    transmute(route_short_name = rc$route_short_name,
+              route_id         = rc$route_id,
+              cell_id, corridor_pos, stop_names)
+}))
+overlap_summary
+```
+
+### Save the rail corridors
+
+```{r save-rail-corridors}
+saveRDS(
+  list(
+    corridors    = rail_corridors,
+    service_date = as.character(params$service_date),
+    tt_window    = c(params$tt_window_start, params$tt_window_end),
+    source_feeds = basename(gtfs_zips)
+  ),
+  file.path(params$out_dir, "rail_corridors.rds")
+)
+
+# Flat CSV across all corridors for easy inspection
+fwrite(
+  bind_rows(lapply(rail_corridors, function(rc) {
+    rc$corridor_cells %>%
+      mutate(route_id = rc$route_id,
+             route_short_name = rc$route_short_name)
+  })) %>%
+    select(route_id, route_short_name, corridor_pos, cell_id,
+           stop_names, dt_to_next_sec, is_pmedian_node),
+  file.path(params$out_dir, "rail_corridor_cells.csv")
+)
+
+# Per-line interstation times (concatenated)
+fwrite(
+  bind_rows(lapply(rail_corridors, function(rc) {
+    rc$seg_times %>%
+      as.data.frame() %>%
+      mutate(route_id = rc$route_id,
+             route_short_name = rc$route_short_name) %>%
+      select(route_id, route_short_name, everything())
+  })),
+  file.path(params$out_dir, "rail_interstation_times.csv")
+)
+```
+
+## Node-pair demand matrix
+
+For each pair of p-median nodes (i, j), compute total trip demand whose
+origin is in i's Voronoi cell and destination is in j's Voronoi cell.
+This is the "natural market" for direct service between the two nodes.
+
+### Build parcel → node lookup
+
+Each parcel is in a cell; each cell is already assigned to a p-median node
+(the `assigned_node` column from step 1). Chain them.
+
+```{r parcel-to-node}
+parcel_dt <- fread(params$parcel_map_csv)
+parcel_dt[, ParcelID := as.character(ParcelID)]
+
+parcel_sf <- st_as_sf(parcel_dt, wkt = "geometry", crs = params$planar_crs) %>%
+  filter(CityName == "Seattle")
+
+parcel_cell_map <- parcel_sf %>%
+  st_join(grid_demand %>% select(cell_id), join = st_intersects) %>%
+  st_drop_geometry() %>%
+  select(ParcelID, cell_id) %>%
+  filter(!is.na(cell_id)) %>%
+  distinct(ParcelID, .keep_all = TRUE)
+
+# `grid_demand_*.rds` was saved before the p-median enrichment, so the
+# cell→node assignment is in `pmed$assignment`, not `grid_demand`.
+cell_node_lookup <- pmed$assignment %>%
+  select(cell_id, assigned_node)
+
+parcel_node <- parcel_cell_map %>%
+  inner_join(cell_node_lookup, by = "cell_id") %>%
+  select(ParcelID, node_cell = assigned_node)
+
+cat(sprintf("Parcels mapped to nodes: %d\n", nrow(parcel_node)))
+```
+
+### DuckDB query: trips grouped by (origin_node, dest_node)
+
+```{r node-pair-demand}
+con <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+dbExecute(con, "PRAGMA threads=12;")
+dbWriteTable(con, "parcel_node", parcel_node, overwrite = TRUE)
+dbExecute(con, "CREATE INDEX idx_pn ON parcel_node(ParcelID);")
+
+trips_rel <- sprintf(
+  "read_csv_auto('%s', delim='\\t', header=true, quote='\"', escape='\"')",
+  normalizePath(params$trips_tsv, winslash = "/", mustWork = TRUE)
+)
+
+sql <- sprintf("
+  SELECT pn_o.node_cell AS origin_node,
+         pn_d.node_cell AS dest_node,
+         SUM(COALESCE(CAST(t.trexpfac AS DOUBLE), 0.0)) AS demand
+  FROM %s t
+  JOIN parcel_node pn_o ON CAST(t.opcl AS VARCHAR) = pn_o.ParcelID
+  JOIN parcel_node pn_d ON CAST(t.dpcl AS VARCHAR) = pn_d.ParcelID
+  GROUP BY 1, 2
+", trips_rel)
+
+node_pair_demand <- dbGetQuery(con, sql) %>%
+  mutate(origin_node = as.integer(origin_node),
+         dest_node   = as.integer(dest_node))
+dbDisconnect(con, shutdown = TRUE)
+
+cat(sprintf("Node-pair demand rows: %d\n", nrow(node_pair_demand)))
+cat(sprintf("Total intra-Seattle demand (both ends in some node's catchment): %s\n",
+            format(round(sum(node_pair_demand$demand)), big.mark = ",")))
+```
+
+### Pivot to a demand matrix
+
+```{r demand-matrix}
+node_ids <- sort(pmed$nodes$cell_id)
+n_nodes  <- length(node_ids)
+
+W_directed <- matrix(0, n_nodes, n_nodes,
+                     dimnames = list(node_ids, node_ids))
+for (k in seq_len(nrow(node_pair_demand))) {
+  i <- match(node_pair_demand$origin_node[k], node_ids)
+  j <- match(node_pair_demand$dest_node[k],   node_ids)
+  if (!is.na(i) && !is.na(j)) {
+    W_directed[i, j] <- node_pair_demand$demand[k]
+  }
+}
+
+# Symmetric undirected demand — corridor design treats lines as bidirectional
+W <- W_directed + t(W_directed)
+diag(W) <- 0   # self-trips don't motivate a corridor
+
+# Sanity: top 10 node pairs by undirected demand
+top_pairs <- as.data.frame(as.table(W)) %>%
+  rename(node_a = Var1, node_b = Var2, demand = Freq) %>%
+  filter(as.integer(as.character(node_a)) < as.integer(as.character(node_b))) %>%
+  arrange(desc(demand)) %>%
+  head(10)
+top_pairs
+```
+
+## Dodgr setup: road graph + node-to-vertex matching
+
+We use the cached PSRC motorcar graph (built by `StreetSetup.Rmd`).
+Each p-median node centroid gets snapped to its nearest connected graph vertex.
+
+```{r dodgr-load}
+if (!file.exists(params$graph_rds)) stop("No dodgr graph available. Run StreetSetup.Rmd first.")
+graph <- readRDS(params$graph_rds)
+cat(sprintf("Loaded dodgr graph: %d edges\n", nrow(graph)))
+
+# Drop `service` highways (alleys, parking-lot access, driveways).
+# Convention from Phase2RunSimulation.Rmd: service edges add routing
+# noise and rarely serve through-traffic. They've caused real perf and
+# correctness problems on this project before.
+if ("highway" %in% colnames(graph)) {
+  n_before <- nrow(graph)
+  graph    <- graph[as.character(graph$highway) != "service", , drop = FALSE]
+  cat(sprintf("Dropped service edges: %d → %d (%d removed)\n",
+              n_before, nrow(graph), n_before - nrow(graph)))
+} else {
+  warning("Graph has no `highway` column — service filter skipped. ",
+          "Routes may include alleys/driveways.")
+}
+
+# Re-extract the largest connected component — removing service edges can
+# orphan pieces that were only reachable through them.
+n_before <- nrow(graph)
+graph    <- dodgr::dodgr_components(graph)
+graph    <- graph[graph$component == 1L, , drop = FALSE]
+cat(sprintf("Largest component: %d → %d edges (%d dropped in smaller components)\n",
+            n_before, nrow(graph), n_before - nrow(graph)))
+
+cat(sprintf("Final graph: %d edges, %d distinct way_ids\n",
+            nrow(graph), length(unique(graph$way_id))))
+```
+
+```{r node-to-vertex}
+# Default node anchor = cell centroid. We may override per-cell below using
+# the ArcGIS-snapped shapefile.
+nodes_sf <- grid_demand %>%
+  filter(cell_id %in% node_ids) %>%
+  arrange(match(cell_id, node_ids))
+
+node_centroids_planar <- st_centroid(nodes_sf)
+node_centroids_4326   <- st_transform(node_centroids_planar, 4326)
+node_lonlat <- st_coordinates(node_centroids_4326)
+colnames(node_lonlat) <- c("x", "y")  # dodgr expects x, y
+
+# Override with snapped points if the shapefile is available.
+# Guard each piece explicitly — nzchar(NULL) returns logical(0), which
+# short-circuits weirdly, and file.exists(NULL) errors with
+# "invalid 'file' argument". So check NULL / length / non-NA first.
+snap_path <- params$snapped_stops_shp
+has_snap  <- is.character(snap_path) &&
+             length(snap_path) == 1L &&
+             !is.na(snap_path) &&
+             nzchar(snap_path) &&
+             file.exists(snap_path)
+
+snapped_cell_ids <- integer(0)
+
+if (has_snap) {
+  snap_sf <- sf::st_read(snap_path, quiet = TRUE)
+
+  # Find the cell_id column (case-insensitive — ArcGIS sometimes uppercases)
+  cid_col <- names(snap_sf)[grep("^cell_?id$", names(snap_sf), ignore.case = TRUE)][1]
+  if (is.na(cid_col)) {
+    stop("Snapped shapefile is missing a `cell_id` column. Re-edit on top of ",
+         "the exported `corridors_stops.shp`, which has it.")
+  }
+
+  # Re-project to 4326 if needed
+  if (is.na(sf::st_crs(snap_sf)) || sf::st_crs(snap_sf)$epsg != 4326L) {
+    snap_sf <- sf::st_transform(snap_sf, 4326)
+  }
+  snap_xy <- sf::st_coordinates(snap_sf)
+  snap_lookup <- data.frame(
+    cell_id = as.integer(snap_sf[[cid_col]]),
+    x       = snap_xy[, "X"],
+    y       = snap_xy[, "Y"],
+    stringsAsFactors = FALSE
+  )
+
+  ord_in_lookup <- match(nodes_sf$cell_id, snap_lookup$cell_id)
+  override_rows <- which(!is.na(ord_in_lookup))
+  node_lonlat[override_rows, "x"] <- snap_lookup$x[ord_in_lookup[override_rows]]
+  node_lonlat[override_rows, "y"] <- snap_lookup$y[ord_in_lookup[override_rows]]
+
+  snapped_cell_ids <- nodes_sf$cell_id[override_rows]
+
+  cat(sprintf("Node anchor source: snapped shapefile (%d / %d nodes overridden)\n",
+              length(override_rows), nrow(nodes_sf)))
+
+  missing_in_shp <- nodes_sf$cell_id[is.na(ord_in_lookup)]
+  if (length(missing_in_shp) > 0) {
+    warning("Snapped shapefile is missing these p-median cell_ids — ",
+            "their nodes will use cell centroids: ",
+            paste(missing_in_shp, collapse = ", "))
+  }
+} else {
+  cat("Node anchor source: cell centroids (no snapped shapefile at: ",
+      if (is.null(snap_path) || length(snap_path) == 0) "<unset>" else snap_path,
+      ")\n", sep = "")
+}
+
+# Match each (overridden or centroid) anchor to its nearest CONNECTED graph vertex
+graph_v   <- dodgr::dodgr_vertices(graph)
+match_idx <- dodgr::match_pts_to_verts(graph_v,
+                                       as.data.frame(node_lonlat),
+                                       connected = TRUE)
+
+node_info <- data.frame(
+  node_idx      = seq_len(n_nodes),
+  cell_id       = nodes_sf$cell_id,
+  vertex_id     = graph_v$id[match_idx],
+  lon           = node_lonlat[, "x"],
+  lat           = node_lonlat[, "y"],
+  anchor_source = ifelse(nodes_sf$cell_id %in% snapped_cell_ids,
+                         "snapped", "centroid"),
+  stringsAsFactors = FALSE
+)
+
+# Buffered-access vertex sets — each node is a CATCHMENT, not a point.
+# Routes can enter/exit via any graph vertex within `node_buffer_ft` of the
+# canonical node lat/lon. node_vert_ids[[i]] is the vector of vertex IDs.
+graph_v_planar <- sf::st_as_sf(
+  data.frame(id = graph_v$id, x = graph_v$x, y = graph_v$y),
+  coords = c("x", "y"), crs = 4326
+) %>% sf::st_transform(params$planar_crs)
+
+buffer_ft_nodes <- params$node_buffer_ft
+node_vert_ids   <- vector("list", n_nodes)
+for (i in seq_len(n_nodes)) {
+  if (buffer_ft_nodes <= 0) {
+    node_vert_ids[[i]] <- node_info$vertex_id[i]   # single-vertex fallback
+    next
+  }
+  pt <- sf::st_sfc(sf::st_point(c(node_info$lon[i], node_info$lat[i])),
+                   crs = 4326) %>% sf::st_transform(params$planar_crs)
+  dists <- as.numeric(sf::st_distance(graph_v_planar, pt))
+  near <- which(dists <= buffer_ft_nodes)
+  if (length(near) == 0L) {
+    node_vert_ids[[i]] <- node_info$vertex_id[i]   # fallback: keep snapped
+  } else {
+    node_vert_ids[[i]] <- graph_v$id[near]
+  }
+}
+
+cat(sprintf("Per-node candidate vertices (within %g ft): min=%g, median=%g, max=%g\n",
+            buffer_ft_nodes,
+            min(lengths(node_vert_ids)),
+            median(lengths(node_vert_ids)),
+            max(lengths(node_vert_ids))))
+
+node_info
+```
+
+## Transfer points
+
+Optional intersections / transit centers a bus can stop at while passing
+by, to enable transfers between routes that don't share a p-median node.
+A candidate corridor's road path is **not** re-routed to touch them — if
+the natural path is within `transfer_buffer_ft` of one, the bus picks it
+up. Transfer points carry zero demand themselves.
+
+```{r load-transfer-points}
+tp_path <- params$transfer_points_shp
+has_tp  <- is.character(tp_path) &&
+           length(tp_path) == 1L &&
+           !is.na(tp_path) &&
+           nzchar(tp_path) &&
+           file.exists(tp_path)
+
+if (has_tp) {
+  transfer_pts_sf <- sf::st_read(tp_path, quiet = TRUE)
+
+  # Find Name column (case-insensitive)
+  name_col <- names(transfer_pts_sf)[
+    grep("^name$", names(transfer_pts_sf), ignore.case = TRUE)
+  ][1]
+  if (is.na(name_col)) {
+    transfer_pts_sf$Name <- sprintf("TP%02d", seq_len(nrow(transfer_pts_sf)))
+    name_col <- "Name"
+  }
+
+  transfer_pts_4326   <- sf::st_transform(transfer_pts_sf, 4326)
+  transfer_pts_planar <- sf::st_transform(transfer_pts_sf, params$planar_crs)
+
+  tp_lonlat <- sf::st_coordinates(transfer_pts_4326)
+  colnames(tp_lonlat) <- c("x", "y")
+
+  tp_match <- dodgr::match_pts_to_verts(
+    graph_v, as.data.frame(tp_lonlat), connected = TRUE
+  )
+
+  n_transfer <- nrow(transfer_pts_sf)
+
+  transfer_info <- data.frame(
+    tp_idx    = seq_len(n_transfer),
+    name      = as.character(transfer_pts_sf[[name_col]]),
+    vertex_id = graph_v$id[tp_match],
+    lon       = tp_lonlat[, "x"],
+    lat       = tp_lonlat[, "y"],
+    stringsAsFactors = FALSE
+  )
+} else {
+  # No file — empty transfer set. Pipeline still works; just no extra hubs.
+  transfer_pts_planar <- sf::st_sfc(crs = params$planar_crs)
+  n_transfer    <- 0L
+  transfer_info <- data.frame(
+    tp_idx    = integer(0),
+    name      = character(0),
+    vertex_id = character(0),
+    lon       = numeric(0),
+    lat       = numeric(0),
+    stringsAsFactors = FALSE
+  )
+}
+
+cat(sprintf("Transfer points loaded: %d\n", n_transfer))
+
+# Buffered-access vertex sets for transfer points (same idea as nodes)
+transfer_vert_ids <- vector("list", n_transfer)
+if (n_transfer > 0L) {
+  for (i in seq_len(n_transfer)) {
+    if (buffer_ft_nodes <= 0) {
+      transfer_vert_ids[[i]] <- transfer_info$vertex_id[i]
+      next
+    }
+    pt <- sf::st_sfc(sf::st_point(c(transfer_info$lon[i], transfer_info$lat[i])),
+                     crs = 4326) %>% sf::st_transform(params$planar_crs)
+    dists <- as.numeric(sf::st_distance(graph_v_planar, pt))
+    near <- which(dists <= buffer_ft_nodes)
+    transfer_vert_ids[[i]] <- if (length(near) == 0L)
+      transfer_info$vertex_id[i] else graph_v$id[near]
+  }
+  cat(sprintf("Per-TP candidate vertices: min=%g, median=%g, max=%g\n",
+              min(lengths(transfer_vert_ids)),
+              median(lengths(transfer_vert_ids)),
+              max(lengths(transfer_vert_ids))))
+}
+
+transfer_info
+```
+
+## Enumerate candidate bus corridors
+
+For each unordered pair (A, B) we generate one candidate corridor per
+acceptable interior subset of other p-median nodes. A corridor
+`A → C₁ → … → Cₖ → B` is **acceptable** if its total length on the road
+graph is at most `max_detour_ratio` × direct(A, B). This lets the greedy
+step combine pairs like `429 → 542 → 558` into a single line when
+geographically reasonable, instead of picking three separate 2-node routes.
+
+We also build the all-pairs road paths from dodgr (`all_paths`) — needed
+later to draw each selected bus corridor's actual road geometry on the map.
+
+```{r dodgr-all-paths}
+# With buffered access we compute paths *between best access-vertex pairs*.
+# For each (i, j), we pick the (vA ∈ node_vert_ids[[i]], vB ∈ node_vert_ids[[j]])
+# pair that minimizes road travel time, then return the path between them.
+# The node-distance-matrix chunk below computes the time matrix using the
+# same buffered min, so the path geometry and the routing times are consistent.
+
+v_idx_by_id <- setNames(seq_len(nrow(graph_v)), graph_v$id)
+
+path_to_coords <- function(vertex_ids) {
+  if (is.null(vertex_ids) || length(vertex_ids) < 2) return(NULL)
+  idx <- v_idx_by_id[as.character(vertex_ids)]
+  idx <- idx[!is.na(idx)]
+  if (length(idx) < 2) return(NULL)
+  cbind(graph_v$x[idx], graph_v$y[idx])
+}
+```
+
+### All-stops time matrix
+
+Time-based throughout — `dodgr_times()` uses the graph's per-edge travel
+time (OSM `maxspeed` × edge length, weighted by the motorcar profile), so
+freeway corridors get short times and local streets get long ones.
+No more global `bus_speed_mph` constant.
+
+The full matrix includes both p-median nodes and transfer points (if any),
+so the same matrix supports the detour-ratio check (subset to p-median ×
+p-median = `T_node_min`) and transfer-hub lookups.
+
+```{r node-distance-matrix}
+# Buffered routing: for each stop (node OR transfer point), we have multiple
+# candidate access vertices. Travel time between two stops = min over all
+# (vA, vB) candidate pairs of dodgr_times(vA, vB). Eliminates one-way-street
+# artifacts that would otherwise inflate the time by forcing routes to
+# loop around blocks to reach a single canonical vertex.
+
+# All candidate vertices, with stop-index ownership (so we can sub-matrix)
+stop_vert_ids <- c(node_vert_ids,
+                   if (n_transfer > 0L) transfer_vert_ids else list())
+all_vert_ids  <- unique(unlist(stop_vert_ids))
+n_full        <- length(stop_vert_ids)
+
+cat(sprintf("Routing over %d unique candidate vertices (%d stops total)\n",
+            length(all_vert_ids), n_full))
+
+# One big dodgr_times call — all candidates × all candidates
+T_big_sec <- dodgr::dodgr_times(
+  graph,
+  from = all_vert_ids,
+  to   = all_vert_ids
+)
+
+# For each (stop_i, stop_j), take the min travel time over candidate-vertex pairs.
+T_full_min <- matrix(Inf, n_full, n_full)
+for (i in seq_len(n_full)) {
+  v_i_idx <- match(stop_vert_ids[[i]], all_vert_ids)
+  for (j in seq_len(n_full)) {
+    if (i == j) { T_full_min[i, j] <- 0; next }
+    v_j_idx <- match(stop_vert_ids[[j]], all_vert_ids)
+    sub <- T_big_sec[v_i_idx, v_j_idx, drop = FALSE]
+    if (all(!is.finite(sub))) next
+    T_full_min[i, j] <- min(sub, na.rm = TRUE) / 60
+  }
+}
+
+T_node_min <- T_full_min[seq_len(n_nodes), seq_len(n_nodes), drop = FALSE]
+
+dimnames(T_node_min) <- list(node_info$cell_id, node_info$cell_id)
+dimnames(T_full_min) <- list(
+  c(as.character(node_info$cell_id),
+    if (n_transfer > 0) sprintf("TP_%s", transfer_info$name) else character(0)),
+  c(as.character(node_info$cell_id),
+    if (n_transfer > 0) sprintf("TP_%s", transfer_info$name) else character(0))
+)
+
+cat(sprintf("All-stops time matrix: %d × %d (p-median: %d, transfer: %d)\n",
+            n_full, n_full, n_nodes, n_transfer))
+cat(sprintf("P-median pairwise travel time: %.1f min — %.1f min (avg %.1f)\n",
+            min(T_node_min[lower.tri(T_node_min)]),
+            max(T_node_min[lower.tri(T_node_min)]),
+            mean(T_node_min[lower.tri(T_node_min)])))
+
+# Path geometry uses each node's PRIMARY snapped vertex (one per node), via the
+# standard nested dodgr_paths call — reliable, positionally indexed as
+# all_paths[[i]][[j]]. Routing TIMES above already use the buffered min, so the
+# model isn't penalized by one-way access; only the *drawn* geometry uses a
+# single canonical vertex (cosmetic).
+all_paths <- dodgr::dodgr_paths(
+  graph,
+  from = node_info$vertex_id,
+  to   = node_info$vertex_id,
+  vertices = TRUE
+)
+```
+
+### Detour-bounded enumeration
+
+```{r enumerate-corridors}
+# Enumeration runs on TIME (minutes) — detour ratio = corridor_time / direct_time.
+enumerate_corridors_detour <- function(T_node, max_detour, max_nodes) {
+  n <- nrow(T_node)
+  out <- list()
+
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      direct <- T_node[i, j]
+      if (!is.finite(direct) || direct == 0) next
+
+      out[[length(out) + 1]] <- list(
+        sequence        = c(i, j),
+        path_length_min = direct,
+        detour_ratio    = 1.0,
+        pair_id         = sprintf("%d_%d", i, j)
+      )
+
+      others <- setdiff(seq_len(n), c(i, j))
+      via    <- T_node[i, others] + T_node[others, j]
+      ratios <- via / direct
+      in_flight <- others[is.finite(ratios) & ratios <= max_detour]
+      if (length(in_flight) == 0L) next
+
+      for (cc in in_flight) {
+        pl <- T_node[i, cc] + T_node[cc, j]
+        out[[length(out) + 1]] <- list(
+          sequence        = c(i, cc, j),
+          path_length_min = pl,
+          detour_ratio    = pl / direct,
+          pair_id         = sprintf("%d_%d", i, j)
+        )
+      }
+
+      max_interior <- min(length(in_flight), max_nodes - 2L)
+      if (max_interior < 2L) next
+
+      for (k in 2:max_interior) {
+        subsets <- combn(in_flight, k, simplify = FALSE)
+        for (subset in subsets) {
+          ordered_subset <- subset[order(T_node[i, subset])]
+          seq_v   <- c(i, ordered_subset, j)
+          edges   <- cbind(seq_v[-length(seq_v)], seq_v[-1])
+          pl      <- sum(T_node[edges])
+          r       <- pl / direct
+          if (r <= max_detour) {
+            out[[length(out) + 1]] <- list(
+              sequence        = seq_v,
+              path_length_min = pl,
+              detour_ratio    = r,
+              pair_id         = sprintf("%d_%d", i, j)
+            )
+          }
+        }
+      }
+    }
+  }
+  out
+}
+
+candidates <- enumerate_corridors_detour(
+  T_node_min,
+  max_detour = params$max_detour_ratio,
+  max_nodes  = params$max_corridor_nodes
+)
+
+cat(sprintf("Enumerated %d candidate corridors (max_detour = %.2f, max_nodes = %d)\n",
+            length(candidates), params$max_detour_ratio, params$max_corridor_nodes))
+
+table(corridor_length_in_nodes =
+        vapply(candidates, function(c) length(c$sequence), integer(1)))
+```
+
+### Augment candidates with transfer points
+
+For each ordered p-median pair `(i, j)`, find transfer points whose
+location is within `transfer_buffer_ft` of the dodgr road path `i → j`,
+ordered by their projected position along the path. Then walk each
+candidate corridor and insert those transfer points between consecutive
+p-median nodes — the corridor's road geometry is unchanged; we just pick
+up extra stops.
+
+```{r augment-candidates}
+# Distance of a point's perpendicular projection along a linestring,
+# in the line's CRS units. Used to ORDER transfer points along a path.
+project_distance_along_line <- function(line_sf, point_sf) {
+  lc <- sf::st_coordinates(line_sf)
+  pc <- sf::st_coordinates(point_sf)
+  px <- pc[1, "X"]; py <- pc[1, "Y"]
+  n  <- nrow(lc)
+  if (n < 2) return(NA_real_)
+  best_d2 <- Inf; best_pos <- 0; cum_dist <- 0
+  for (k in seq_len(n - 1)) {
+    x1 <- lc[k,     "X"]; y1 <- lc[k,     "Y"]
+    x2 <- lc[k + 1L,"X"]; y2 <- lc[k + 1L,"Y"]
+    dx <- x2 - x1; dy <- y2 - y1
+    seg_len2 <- dx * dx + dy * dy
+    if (seg_len2 == 0) next
+    seg_len <- sqrt(seg_len2)
+    t <- ((px - x1) * dx + (py - y1) * dy) / seg_len2
+    t <- max(0, min(1, t))
+    proj_x <- x1 + t * dx; proj_y <- y1 + t * dy
+    d2     <- (px - proj_x)^2 + (py - proj_y)^2
+    if (d2 < best_d2) {
+      best_d2  <- d2
+      best_pos <- cum_dist + t * seg_len
+    }
+    cum_dist <- cum_dist + seg_len
+  }
+  best_pos
+}
+
+buffer_ft <- params$transfer_buffer_ft
+dwell_min <- params$express_dwell_sec / 60
+
+# Precompute near_T[[i, j]] = ordered transfer-point indices on dodgr path i→j
+near_T <- vector("list", n_nodes * n_nodes)
+dim(near_T) <- c(n_nodes, n_nodes)
+
+if (n_transfer > 0L) {
+  for (i in seq_len(n_nodes)) {
+    for (j in seq_len(n_nodes)) {
+      if (i == j) { near_T[[i, j]] <- integer(0); next }
+      vids   <- all_paths[[i]][[j]]
+      coords <- path_to_coords(vids)
+      if (is.null(coords) || nrow(coords) < 2) {
+        near_T[[i, j]] <- integer(0); next
+      }
+      line_planar <- sf::st_linestring(coords) |>
+        sf::st_sfc(crs = 4326) |>
+        sf::st_transform(params$planar_crs)
+      dists <- as.numeric(sf::st_distance(transfer_pts_planar, line_planar))
+      near_idx <- which(dists <= buffer_ft)
+      if (length(near_idx) == 0L) {
+        near_T[[i, j]] <- integer(0); next
+      }
+      positions <- vapply(near_idx, function(k) {
+        pt <- sf::st_geometry(transfer_pts_planar)[k]
+        project_distance_along_line(line_planar, pt)
+      }, numeric(1))
+      near_T[[i, j]] <- near_idx[order(positions)]
+    }
+  }
+} else {
+  # No transfer points → all empty
+  for (i in seq_len(n_nodes)) for (j in seq_len(n_nodes)) {
+    near_T[[i, j]] <- integer(0)
+  }
+}
+
+# Augment one corridor's p-median sequence with transfer-point indices
+# (offset by n_nodes) and compute cumulative arrival times along the
+# resulting full stop sequence. Each non-initial stop adds `dwell_min`
+# at the previous stop plus the segment time to itself.
+augment_corridor <- function(seq_v, near_T, T_full_min, dwell_min, n_nodes) {
+  full <- integer(0)
+  for (k in seq_along(seq_v)) {
+    full <- c(full, seq_v[k])
+    if (k < length(seq_v)) {
+      tps <- near_T[[seq_v[k], seq_v[k + 1]]]
+      if (length(tps) > 0L) full <- c(full, n_nodes + tps)
+    }
+  }
+  if (length(full) < 2L) {
+    cum_t <- 0
+  } else {
+    edges <- cbind(full[-length(full)], full[-1])
+    seg_t <- T_full_min[edges]
+    cum_t <- c(0, cumsum(seg_t + dwell_min))
+  }
+  list(full_seq = full, cum_t = cum_t)
+}
+
+for (i in seq_along(candidates)) {
+  aug <- augment_corridor(candidates[[i]]$sequence, near_T, T_full_min,
+                          dwell_min, n_nodes)
+  candidates[[i]]$full_seq         <- aug$full_seq
+  candidates[[i]]$cum_t            <- aug$cum_t
+  candidates[[i]]$n_transfer_stops <- length(aug$full_seq) -
+                                      length(candidates[[i]]$sequence)
+  candidates[[i]]$travel_time_min  <- if (length(aug$cum_t) > 0L)
+                                        tail(aug$cum_t, 1) else 0
+}
+
+n_with_tp <- sum(vapply(candidates,
+                        function(c) c$n_transfer_stops > 0L, logical(1)))
+cat(sprintf("Augmented %d candidates with transfer points (buffer = %d ft); %d pick up ≥1 TP\n",
+            length(candidates), buffer_ft, n_with_tp))
+```
+
+## Greedy with quality-threshold stopping
+
+For each unordered node-pair (i, j) we compute the **service quality**:
+
+> `quality(i, j) = T_service(i, j) / T_direct_road(i, j)`
+
+where `T_service` is the fastest of:
+- riding a single selected corridor from i to j (along the corridor's actual
+  stop-by-stop path, which may detour through intermediates),
+- transferring at some hub h (best corridor i→h + 2.5 min + best corridor h→j).
+
+A pair is **served** if `quality ≤ 1 + quality_threshold_pct` (e.g., ≤1.5×
+direct road time when threshold = 0.5). Pairs that exceed this threshold —
+or are flat-out unreachable — incur a **penalty** = demand × excess time
+above threshold. Unreachable pairs are assigned `quality = unreachable_quality`
+so the penalty is large but finite.
+
+**Greedy stops when total penalty hits zero** (every pair meets the
+quality threshold), not when a corridor budget is hit. Since penalty is
+weighted by demand, the heuristic naturally drives high-volume pairs to
+quality ≈ 1 first; low-volume pairs end up at quality closer to the
+threshold (or, if the safety cap is hit, slightly above).
+
+```{r greedy-with-transfer}
+cell_to_node_idx <- setNames(node_info$node_idx, as.character(node_info$cell_id))
+
+# Rail cell sequences → p-median node indices
+rail_node_seqs <- lapply(rail_corridors, function(rc) {
+  seq_v <- rc$corridor_cells %>%
+    filter(is_pmedian_node) %>%
+    arrange(corridor_pos) %>%
+    pull(cell_id) %>%
+    as.character() %>%
+    cell_to_node_idx[.] %>%
+    unname()
+  seq_v[!is.na(seq_v)]
+})
+
+for (i in seq_along(rail_node_seqs)) {
+  rc    <- rail_corridors[[i]]
+  seq_v <- rail_node_seqs[[i]]
+  cat(sprintf("%-15s covers %d p-median nodes: %s\n",
+              rc$route_short_name, length(seq_v),
+              if (length(seq_v) > 0)
+                paste(node_info$cell_id[seq_v], collapse = ", ")
+              else "(none)"))
+}
+
+transfer_pen        <- params$transfer_penalty_min
+quality_threshold   <- 1 + params$quality_threshold_pct
+unreachable_quality <- params$unreachable_quality
+
+# For a set of selected corridors, compute the best service time for every
+# node-pair. Each corridor carries `full_seq` (p-median + transfer stops)
+# and `cum_t` (cumulative arrival times along that sequence, including
+# stop dwell), both built at enumeration time. Travel time between any
+# two stops on a corridor = abs(cum_t[b] - cum_t[a]).
+#
+# Transfer points (indices > n_nodes) carry zero demand but ARE valid hubs
+# — so a pair (i, j) of p-median nodes can be served via a transfer point
+# h shared between two different corridors.
+compute_service <- function(selected, transfer_pen, n_full, n_nodes) {
+  T_direct <- matrix(Inf, n_full, n_full)
+  diag(T_direct) <- 0
+
+  for (c in selected) {
+    full_seq <- c$full_seq
+    cum_t    <- c$cum_t
+    if (is.null(full_seq) || length(full_seq) < 2L) next
+
+    K <- length(full_seq)
+    for (a in 1:K) {
+      ti <- full_seq[a]
+      for (b in 1:K) {
+        if (a == b) next
+        tj <- full_seq[b]
+        t_ab <- abs(cum_t[b] - cum_t[a])
+        if (t_ab < T_direct[ti, tj]) T_direct[ti, tj] <- t_ab
+      }
+    }
+  }
+
+  # Hub iteration includes transfer points (indices > n_nodes)
+  T_service <- T_direct[seq_len(n_nodes), seq_len(n_nodes), drop = FALSE]
+  for (i in 1:(n_nodes - 1)) {
+    for (j in (i + 1):n_nodes) {
+      for (h in seq_len(n_full)) {
+        if (h == i || h == j) next
+        if (is.finite(T_direct[i, h]) && is.finite(T_direct[h, j])) {
+          via_h <- T_direct[i, h] + transfer_pen + T_direct[h, j]
+          if (via_h < T_service[i, j]) {
+            T_service[i, j] <- via_h
+            T_service[j, i] <- via_h
+          }
+        }
+      }
+    }
+  }
+
+  list(
+    direct  = T_direct[seq_len(n_nodes), seq_len(n_nodes), drop = FALSE],
+    service = T_service
+  )
+}
+
+# Penalty: demand-weighted travel-time excess above the quality threshold.
+# Unreachable pairs are treated as if quality = unreachable_quality.
+compute_penalty <- function(T_service, W, T_road, quality_threshold,
+                            unreachable_quality) {
+  n <- nrow(W)
+  effective <- T_service
+  unreach <- !is.finite(effective)
+  effective[unreach] <- T_road[unreach] * unreachable_quality
+
+  threshold_time <- quality_threshold * T_road
+  excess  <- pmax(0, effective - threshold_time)
+  penalty <- W * excess
+  diag(penalty) <- 0
+
+  quality <- effective / pmax(T_road, 1e-9)
+
+  list(
+    total       = sum(penalty[lower.tri(penalty)]),
+    per_pair    = penalty,
+    quality     = quality,
+    n_over      = sum(excess[lower.tri(excess)] > 0),
+    n_unreach   = sum(unreach[lower.tri(unreach)])
+  )
+}
+
+# Initialize: rail pre-seed. Rail corridors don't auto-pick-up transfer
+# points (their geometry isn't a dodgr road path), so full_seq = sequence,
+# and cum_t uses T_node_min for consecutive p-median pairs + dwell at each
+# stop.
+selected_corridors <- list()
+prev_penalty <- Inf
+for (i in seq_along(rail_corridors)) {
+  rc    <- rail_corridors[[i]]
+  seq_v <- rail_node_seqs[[i]]
+
+  if (length(seq_v) >= 2L) {
+    edges_r <- cbind(seq_v[-length(seq_v)], seq_v[-1])
+    seg_t_r <- T_node_min[edges_r]
+    cum_t_r <- c(0, cumsum(seg_t_r + dwell_min))
+  } else {
+    cum_t_r <- 0
+  }
+
+  selected_corridors[[length(selected_corridors) + 1]] <- list(
+    type            = "rail",
+    label           = rc$route_short_name,
+    sequence        = seq_v,
+    full_seq        = seq_v,
+    cum_t           = cum_t_r,
+    path_length_min = if (length(cum_t_r) > 0L) tail(cum_t_r, 1) else NA_real_,
+    detour_ratio    = NA_real_,
+    marginal_demand = NA_real_
+  )
+  st  <- compute_service(selected_corridors, transfer_pen, n_full, n_nodes)
+  pen <- compute_penalty(st$service, W, T_node_min, quality_threshold,
+                         unreachable_quality)
+  if (!is.finite(prev_penalty)) {
+    base_pen <- compute_penalty(
+      matrix(Inf, n_nodes, n_nodes),
+      W, T_node_min, quality_threshold, unreachable_quality
+    )$total
+    prev_penalty <- base_pen
+  }
+  selected_corridors[[length(selected_corridors)]]$marginal_demand <-
+    prev_penalty - pen$total
+  prev_penalty <- pen$total
+}
+
+cat(sprintf("\nAfter rail pre-seed: penalty = %s, %d pairs over threshold, %d unreachable\n",
+            format(round(prev_penalty), big.mark = ","),
+            pen$n_over, pen$n_unreach))
+
+# Greedy: keep adding bus corridors until total penalty hits zero
+remaining     <- candidates
+n_total_pairs <- n_nodes * (n_nodes - 1) / 2
+max_step      <- params$n_bus_corridors
+step          <- 0
+
+while (TRUE) {
+  if (prev_penalty == 0) {
+    cat(sprintf("\n*** All %d pairs meet quality threshold (≤%.0f%% slower than direct) after %d bus corridor(s). ***\n",
+                n_total_pairs, params$quality_threshold_pct * 100, step))
+    break
+  }
+  if (step >= max_step) {
+    message("Hit safety cap of ", max_step, " bus corridors. ",
+            pen$n_over, " pairs still over threshold (", pen$n_unreach,
+            " unreachable). Stopping.")
+    break
+  }
+  if (length(remaining) == 0L) {
+    message("Candidate set exhausted. ", pen$n_over, " pairs still over threshold.")
+    break
+  }
+
+  scores <- vapply(remaining, function(c) {
+    test <- c(selected_corridors, list(c))
+    st_new  <- compute_service(test, transfer_pen, n_full, n_nodes)
+    pen_new <- compute_penalty(st_new$service, W, T_node_min,
+                               quality_threshold, unreachable_quality)
+    prev_penalty - pen_new$total
+  }, numeric(1))
+
+  if (max(scores) <= 0) {
+    message("No remaining candidate reduces penalty. ",
+            pen$n_over, " pairs still over threshold. Stopping.")
+    break
+  }
+
+  step <- step + 1L
+  best_idx <- which.max(scores)
+  best     <- remaining[[best_idx]]
+  best$type            <- "bus"
+  best$label           <- sprintf("Bus %d", step)
+  best$marginal_demand <- scores[best_idx]
+
+  selected_corridors[[length(selected_corridors) + 1]] <- best
+  remaining <- remaining[-best_idx]
+
+  st  <- compute_service(selected_corridors, transfer_pen, n_full, n_nodes)
+  pen <- compute_penalty(st$service, W, T_node_min, quality_threshold,
+                         unreachable_quality)
+  prev_penalty <- pen$total
+
+  cat(sprintf("[%2d] %s: %d nodes (+%d TP), %.1f min (det %.2f), Δpenalty = %s, total = %s (over %d, unreach %d)\n",
+              step, best$label,
+              length(best$sequence),
+              best$n_transfer_stops %||% 0L,
+              best$travel_time_min %||% best$path_length_min %||% NA,
+              best$detour_ratio,
+              format(round(best$marginal_demand), big.mark = ","),
+              format(round(prev_penalty), big.mark = ","),
+              pen$n_over, pen$n_unreach))
+}
+
+# Hold the final state for downstream chunks
+state <- list(
+  service        = st$service,
+  direct         = st$direct,
+  penalty_total  = pen$total,
+  quality        = pen$quality,
+  per_pair       = pen$per_pair,
+  n_over         = pen$n_over,
+  n_unreach      = pen$n_unreach
+)
+
+# Final quality stats
+
+cat(sprintf("\n=== Final coverage ===\n"))
+cat(sprintf("Pairs at or below %.0f%% threshold: %d / %d (%.1f%%)\n",
+            params$quality_threshold_pct * 100,
+            n_total_pairs - pen$n_over, n_total_pairs,
+            100 * (n_total_pairs - pen$n_over) / n_total_pairs))
+cat(sprintf("Pairs unreachable (≥2 transfers needed): %d\n", pen$n_unreach))
+cat(sprintf("Avg quality across all pairs: %.2f\n",
+            mean(pen$quality[lower.tri(pen$quality)])))
+cat(sprintf("Demand-weighted avg quality: %.2f\n",
+            sum(pen$quality[lower.tri(pen$quality)] *
+                W[lower.tri(W)]) / sum(W[lower.tri(W)])))
+```
+
+## ILP-based corridor selection (overrides greedy)
+
+Reformulates the corridor selection as a Mixed Integer Linear Program with
+explicit pair-coverage + rightsizing constraints. Globally optimal subject
+to the formulation (greedy is locally optimal).
+
+**Decision variables:** `x_c ∈ {0,1}` for each candidate bus corridor.
+
+**Auxiliary variables:**
+- `u[t] ∈ {0,1}` — one per *viable transfer triple* `(i, j, h)`. A triple is
+  viable only if the best-case via-`h` time (`T(i,h) + penalty + T(h,j)`) is
+  within the pair's quality budget `qt × T(i,j)` — i.e., the hub is genuinely
+  on-path. The leftover slack is split evenly between the two legs, and `u[t]`
+  can fire only if a selected corridor (or rail) serves each leg within its
+  share. So a transfer-covered pair is **guaranteed** at quality ≤ qt — no more
+  off-path hubs faking coverage.
+- `slack[i, j] ∈ {0,1}` — fallback if a pair can't be covered (heavy
+  demand-weighted penalty, so used only when otherwise infeasible).
+
+**Constraints:**
+1. *Pair coverage:* every node-pair served directly OR via a viable transfer
+   OR slack, accounting for rail's pre-existing direct coverage.
+2. *Rightsizing:* for each p-median node `i`,
+   `Σ x_c × touches[c, i]  ≤  rightsize_tolerance × D_i × Σ x_c`.
+
+**Objective:** minimize bus-corridor count + demand-weighted slack penalty.
+
+Because the detour-bounded enumeration caps every candidate at ≤ 1.2 detour,
+any pair *directly* served by a candidate is automatically quality ≤ 1.2, and
+the viable-triple construction makes transfer coverage quality ≤ qt by design.
+Rail corridors stay fixed; their direct + leg contributions enter as constants.
+
+```{r ilp-corridor-selection}
+required_pkgs <- c("ompr", "ompr.roi", "ROI", "ROI.plugin.highs", "highs")
+missing_pkgs  <- required_pkgs[!vapply(required_pkgs,
+                                       requireNamespace, logical(1),
+                                       quietly = TRUE)]
+if (length(missing_pkgs) > 0L) {
+  stop("Install: install.packages(c('",
+       paste(missing_pkgs, collapse = "', '"), "'))")
+}
+suppressPackageStartupMessages({
+  library(ompr)
+  library(ompr.roi)
+  library(ROI.plugin.highs)
+})
+
+N_cand    <- length(candidates)
+tolerance <- params$rightsize_tolerance
+
+# Demand share per p-median node (sums to 1)
+D_share <- rowSums(W) / sum(W)
+
+# Build candidate stop-pair time lookup from full_seq + cum_t
+candidate_t <- vector("list", N_cand)
+for (c_idx in seq_along(candidates)) {
+  cc <- candidates[[c_idx]]
+  fs <- cc$full_seq
+  ct <- cc$cum_t
+  if (is.null(fs) || length(fs) < 2L) {
+    candidate_t[[c_idx]] <- NULL
+    next
+  }
+  Mc <- matrix(Inf, n_full, n_full)
+  K <- length(fs)
+  for (a in 1:K) for (b in 1:K) {
+    if (a == b) next
+    Mc[fs[a], fs[b]] <- min(Mc[fs[a], fs[b]], abs(ct[b] - ct[a]))
+  }
+  candidate_t[[c_idx]] <- Mc
+}
+
+# direct_serves[c, i, j] = 1 if candidate c serves p-median pair (i,j) directly
+# at quality ≤ threshold
+direct_serves <- array(0L, dim = c(N_cand, n_nodes, n_nodes))
+for (c_idx in 1:N_cand) {
+  Mc <- candidate_t[[c_idx]]
+  if (is.null(Mc)) next
+  for (i in 1:n_nodes) for (j in 1:n_nodes) {
+    if (i == j) next
+    if (is.finite(Mc[i, j]) && Mc[i, j] <= quality_threshold * T_node_min[i, j]) {
+      direct_serves[c_idx, i, j] <- 1L
+    }
+  }
+}
+
+# touches[c, i] = 1 if candidate c includes p-median node i in its sequence
+touches <- matrix(0L, N_cand, n_nodes)
+for (c_idx in 1:N_cand) {
+  for (i in candidates[[c_idx]]$sequence) {
+    touches[c_idx, i] <- 1L
+  }
+}
+
+# Rail's pre-seed contribution. rail_direct[i,j] = 1 if a rail line serves pair
+# (i,j) directly at quality ≤ threshold. rail_T[a,b] = best rail travel time
+# between any two stops (used as a transfer-leg provider in viable triples below).
+rail_direct <- matrix(0L, n_nodes, n_nodes)
+rail_T      <- matrix(Inf, n_full, n_full)
+for (sc in selected_corridors) {
+  if (sc$type != "rail") next
+  fs <- sc$full_seq; ct <- sc$cum_t
+  if (is.null(fs) || length(fs) < 2L) next
+  K <- length(fs)
+  for (a in 1:K) for (b in 1:K) {
+    if (a == b) next
+    aa <- fs[a]; bb <- fs[b]
+    t_ab <- abs(ct[b] - ct[a])
+    rail_T[aa, bb] <- min(rail_T[aa, bb], t_ab)
+    if (aa <= n_nodes && bb <= n_nodes && is.finite(t_ab) &&
+        t_ab <= quality_threshold * T_node_min[aa, bb]) {
+      rail_direct[aa, bb] <- 1L
+    }
+  }
+}
+
+cat(sprintf("ILP inputs ready: %d candidates, %d p-median nodes, %d total stops\n",
+            N_cand, n_nodes, n_full))
+cat(sprintf("Rail directly covers %d / %d pairs already\n",
+            sum(rail_direct[lower.tri(rail_direct)]),
+            n_nodes * (n_nodes - 1) / 2))
+
+# ---- Dominance pre-filter ----
+# Drop candidate B if some A directly serves every pair B serves AND touches a
+# subset of B's nodes (≥ as good for coverage, ≤ as costly for equity), with at
+# least one strict. Transfer-leg value is NOT part of dominance now (transfers
+# are handled by viable triples below), so this stays conservative — it never
+# drops a candidate that might uniquely provide a transfer leg.
+cat("Running dominance pre-filter...\n")
+t_pre <- Sys.time()
+
+direct_sets  <- lapply(seq_len(N_cand), function(c) which(direct_serves[c, , ] == 1L))
+touches_sets <- lapply(seq_len(N_cand), function(c) which(touches[c, ] == 1L))
+is_subset <- function(a, b) length(a) == 0L || all(a %in% b)
+
+keep <- rep(TRUE, N_cand)
+for (b in seq_len(N_cand)) {
+  if (!keep[b]) next
+  for (a in seq_len(N_cand)) {
+    if (a == b || !keep[a]) next
+    if (length(direct_sets[[a]])  < length(direct_sets[[b]]))  next
+    if (length(touches_sets[[a]]) > length(touches_sets[[b]])) next
+    if (!is_subset(direct_sets[[b]],  direct_sets[[a]]))  next
+    if (!is_subset(touches_sets[[a]], touches_sets[[b]])) next
+    strict <- (length(direct_sets[[a]])  > length(direct_sets[[b]])) ||
+              (length(touches_sets[[a]]) < length(touches_sets[[b]]))
+    if (strict) { keep[b] <- FALSE; break }
+  }
+}
+
+n_dropped <- N_cand - sum(keep)
+cat(sprintf("  Pre-filter: %d → %d candidates (%d dominated, %.1fs)\n",
+            N_cand, sum(keep), n_dropped,
+            as.numeric(Sys.time() - t_pre, units = "secs")))
+
+kept_idx      <- which(keep)
+candidates    <- candidates[kept_idx]
+candidate_t   <- candidate_t[kept_idx]
+direct_serves <- direct_serves[kept_idx, , , drop = FALSE]
+touches       <- touches[kept_idx, , drop = FALSE]
+N_cand        <- length(candidates)
+
+# ---- Viable transfer triples ----
+# A transfer for pair (i,j) via hub h is viable only if the BEST-CASE total
+# (direct legs + penalty) fits the pair quality budget:
+#     T(i,h) + penalty + T(h,j)  ≤  qt × T(i,j)
+# For each viable triple we split the leftover slack evenly between the two
+# legs and record which candidates (and whether rail) serve each leg within
+# its share. So if u[t] fires, the pair is genuinely served at quality ≤ qt.
+qt  <- quality_threshold
+pen <- transfer_pen
+t_tri <- Sys.time()
+
+triple_i <- integer(0); triple_j <- integer(0); triple_h <- integer(0)
+triple_leg1 <- list(); triple_leg2 <- list()
+triple_rail1 <- integer(0); triple_rail2 <- integer(0)
+
+for (i in 1:(n_nodes - 1)) {
+  for (j in (i + 1):n_nodes) {
+    budget <- qt * T_node_min[i, j]
+    for (h in 1:n_full) {
+      if (h == i || h == j) next
+      d_ih <- T_full_min[i, h]; d_hj <- T_full_min[h, j]
+      best_via <- d_ih + pen + d_hj
+      if (!is.finite(best_via) || best_via > budget) next   # non-viable hub
+      slack_h <- budget - best_via
+      L1 <- d_ih + slack_h / 2
+      L2 <- d_hj + slack_h / 2
+      leg1 <- which(vapply(candidate_t, function(Mc)
+        !is.null(Mc) && is.finite(Mc[i, h]) && Mc[i, h] <= L1, logical(1)))
+      leg2 <- which(vapply(candidate_t, function(Mc)
+        !is.null(Mc) && is.finite(Mc[h, j]) && Mc[h, j] <= L2, logical(1)))
+      r1 <- as.integer(is.finite(rail_T[i, h]) && rail_T[i, h] <= L1)
+      r2 <- as.integer(is.finite(rail_T[h, j]) && rail_T[h, j] <= L2)
+      if ((length(leg1) + r1 == 0L) || (length(leg2) + r2 == 0L)) next
+      triple_i <- c(triple_i, i); triple_j <- c(triple_j, j); triple_h <- c(triple_h, h)
+      triple_leg1[[length(triple_leg1) + 1]] <- leg1
+      triple_leg2[[length(triple_leg2) + 1]] <- leg2
+      triple_rail1 <- c(triple_rail1, r1); triple_rail2 <- c(triple_rail2, r2)
+    }
+  }
+}
+n_triples <- length(triple_i)
+cat(sprintf("Viable transfer triples: %d (%.1fs)\n",
+            n_triples, as.numeric(Sys.time() - t_tri, units = "secs")))
+
+# Coefficient arrays for the model (dim ≥ 1 to avoid zero-length issues)
+serves    <- array(0L, dim = c(max(1L, n_triples), n_nodes, n_nodes))
+leg1_coef <- matrix(0L, max(1L, n_triples), N_cand)
+leg2_coef <- matrix(0L, max(1L, n_triples), N_cand)
+if (n_triples > 0L) {
+  for (t in seq_len(n_triples)) {
+    serves[t, triple_i[t], triple_j[t]] <- 1L
+    if (length(triple_leg1[[t]]) > 0L) leg1_coef[t, triple_leg1[[t]]] <- 1L
+    if (length(triple_leg2[[t]]) > 0L) leg2_coef[t, triple_leg2[[t]]] <- 1L
+  }
+}
+
+# ---- Build ILP ----
+# Slack weighting normalized by mean demand so coefficients stay O(10) and the
+# solver avoids numerical instability. big_M = 10 → slacks 10× a corridor.
+mean_W <- mean(W[lower.tri(W) & W > 0])
+big_M  <- 10
+
+cat("Building model...\n")
+t0 <- Sys.time()
+
+model <- MIPModel() %>%
+  add_variable(x[c], c = 1:N_cand, type = "binary") %>%
+  add_variable(slack[i, j], i = 1:n_nodes, j = 1:n_nodes, i < j, type = "binary")
+
+# Transfer indicator u[t] per viable triple (only if any exist)
+if (n_triples > 0L) {
+  model <- model %>%
+    add_variable(u[t], t = 1:n_triples, type = "binary") %>%
+    # u[t] fires only if a selected corridor (or rail) serves leg 1 ...
+    add_constraint(
+      u[t] <= sum_expr(leg1_coef[t, c] * x[c], c = 1:N_cand) + triple_rail1[t],
+      t = 1:n_triples
+    ) %>%
+    # ... and another serves leg 2
+    add_constraint(
+      u[t] <= sum_expr(leg2_coef[t, c] * x[c], c = 1:N_cand) + triple_rail2[t],
+      t = 1:n_triples
+    )
+}
+
+# Pair coverage: direct OR a viable transfer OR slack ≥ 1 (minus rail direct).
+if (n_triples > 0L) {
+  model <- model %>%
+    add_constraint(
+      sum_expr(direct_serves[c, i, j] * x[c], c = 1:N_cand) +
+        sum_expr(serves[t, i, j] * u[t], t = 1:n_triples) +
+        slack[i, j] >= 1 - rail_direct[i, j],
+      i = 1:n_nodes, j = 1:n_nodes, i < j
+    )
+} else {
+  model <- model %>%
+    add_constraint(
+      sum_expr(direct_serves[c, i, j] * x[c], c = 1:N_cand) +
+        slack[i, j] >= 1 - rail_direct[i, j],
+      i = 1:n_nodes, j = 1:n_nodes, i < j
+    )
+}
+
+model <- model %>%
+  # Rightsizing: Σ_c (touches[c,i] - tolerance × D_i) × x_c ≤ 0
+  add_constraint(
+    sum_expr((touches[c, i] - tolerance * D_share[i]) * x[c], c = 1:N_cand) <= 0,
+    i = 1:n_nodes
+  ) %>%
+  set_objective(
+    sum_expr(x[c], c = 1:N_cand) +
+      big_M * sum_expr((W[i, j] / mean_W) * slack[i, j],
+                       i = 1:n_nodes, j = 1:n_nodes, i < j),
+    "min"
+  )
+
+cat(sprintf("Model built in %.1f s. Solving with HiGHS...\n",
+            as.numeric(Sys.time() - t0, units = "secs")))
+
+t1 <- Sys.time()
+result <- solve_model(model, with_ROI(solver = "highs", verbose = TRUE))
+cat(sprintf("Solver: %s, objective = %.0f, solved in %.1f s\n",
+            solver_status(result),
+            objective_value(result),
+            as.numeric(Sys.time() - t1, units = "secs")))
+
+# ---- Extract solution ----
+selected_x <- get_solution(result, x[c]) %>%
+  filter(value > 0.5) %>%
+  pull(c)
+
+slack_solution <- get_solution(result, slack[i, j]) %>%
+  filter(value > 0.5) %>%
+  mutate(cell_a = node_info$cell_id[i],
+         cell_b = node_info$cell_id[j])
+
+cat(sprintf("\nILP selected %d bus corridors (down from greedy's %d)\n",
+            length(selected_x),
+            sum(vapply(selected_corridors, function(c) c$type == "bus", logical(1)))))
+cat(sprintf("Pairs with slack (impossible to cover under these constraints): %d\n",
+            nrow(slack_solution)))
+if (nrow(slack_solution) > 0) {
+  cat("  Slacks:\n"); print(slack_solution %>% select(cell_a, cell_b))
+}
+
+# ---- Replace selected_corridors: rail + ILP-selected bus ----
+rail_only <- Filter(function(sc) sc$type == "rail", selected_corridors)
+
+bus_selected <- vector("list", length(selected_x))
+for (k in seq_along(selected_x)) {
+  sel <- candidates[[selected_x[k]]]
+  sel$type  <- "bus"
+  sel$label <- sprintf("Bus %d", k)
+  # Demand this corridor serves DIRECTLY (sum of W over node-pairs both on it)
+  sq  <- sel$sequence
+  dem <- 0
+  if (length(sq) >= 2L) {
+    for (a in seq_len(length(sq) - 1L)) for (b in (a + 1L):length(sq)) {
+      dem <- dem + W[sq[a], sq[b]]
+    }
+  }
+  sel$marginal_demand <- dem
+  bus_selected[[k]]   <- sel
+}
+
+selected_corridors <- c(rail_only, bus_selected)
+
+# Recompute final state using the ILP solution
+st  <- compute_service(selected_corridors, transfer_pen, n_full, n_nodes)
+pen <- compute_penalty(st$service, W, T_node_min,
+                       quality_threshold, unreachable_quality)
+state <- list(
+  service       = st$service,
+  direct        = st$direct,
+  penalty_total = pen$total,
+  quality       = pen$quality,
+  per_pair      = pen$per_pair,
+  n_over        = pen$n_over,
+  n_unreach     = pen$n_unreach
+)
+
+# ---- Rightsizing audit ----
+if (length(selected_x) > 0L) {
+  service_counts <- colSums(touches[selected_x, , drop = FALSE])
+  total_bus      <- length(selected_x)
+  service_share  <- service_counts / total_bus
+} else {
+  service_share <- rep(0, n_nodes)
+}
+
+rightsize_df <- data.frame(
+  cell_id       = node_info$cell_id,
+  demand_share  = round(D_share, 3),
+  service_share = round(service_share, 3),
+  ratio         = round(service_share / pmax(D_share, 1e-9), 2),
+  cap           = round(tolerance * D_share, 3),
+  ok            = service_share <= tolerance * D_share + 1e-6
+)
+cat(sprintf("\nRightsizing audit (S_i / D_i ≤ %.1f):\n", tolerance))
+print(rightsize_df)
+```
+
+### Prune redundant routes
+
+A route is **redundant** if removing it leaves *every* node-pair's best service
+time unchanged — the rest of the network already serves all of that route's
+pairs at least as fast. The ILP can keep redundant routes purely to inflate the
+corridor count `N`, which loosens the rightsizing cap `n_i / N ≤ tol × D_i` for
+heavily-used nodes. Dropping them only relaxes rightsizing (which we accept) and
+**provably cannot slow any trip or strand any pair**.
+
+This iteratively drops redundant routes. Note a route whose stop-set is a
+*subset* of another's is NOT automatically redundant — if it serves an internal
+pair faster than the longer route's detour through that pair, it's genuinely
+needed and is kept.
+
+```{r prune-subset-routes}
+n_before_prune <- sum(vapply(selected_corridors, function(c) c$type == "bus", logical(1)))
+
+repeat {
+  bus_idx     <- which(vapply(selected_corridors, function(c) c$type == "bus", logical(1)))
+  dropped_one <- FALSE
+  for (b in bus_idx) {
+    trial    <- selected_corridors[-b]
+    st_trial <- compute_service(trial, transfer_pen, n_full, n_nodes)
+    lt       <- lower.tri(state$service)
+    # Does removing this route make ANY pair strictly slower (incl. → unreachable)?
+    worse <- st_trial$service[lt] > state$service[lt] + 1e-9
+    if (!any(worse, na.rm = TRUE)) {
+      cat(sprintf("Dropping redundant route %s [%s]\n",
+                  selected_corridors[[b]]$label,
+                  paste(node_info$cell_id[selected_corridors[[b]]$sequence],
+                        collapse = " → ")))
+      selected_corridors <- trial
+      st  <- st_trial
+      pen <- compute_penalty(st$service, W, T_node_min,
+                             quality_threshold, unreachable_quality)
+      state <- list(service = st$service, direct = st$direct,
+                    penalty_total = pen$total, quality = pen$quality,
+                    per_pair = pen$per_pair, n_over = pen$n_over,
+                    n_unreach = pen$n_unreach)
+      dropped_one <- TRUE
+      break
+    }
+  }
+  if (!dropped_one) break
+}
+
+# Re-label bus corridors sequentially after the drops
+bus_ctr <- 0L
+for (s in seq_along(selected_corridors)) {
+  if (selected_corridors[[s]]$type == "bus") {
+    bus_ctr <- bus_ctr + 1L
+    selected_corridors[[s]]$label <- sprintf("Bus %d", bus_ctr)
+  }
+}
+
+n_bus_after <- sum(vapply(selected_corridors, function(c) c$type == "bus", logical(1)))
+cat(sprintf("\nRedundant-route prune: %d → %d bus corridors. Over threshold: %d. Unreachable: %d. (No trip slowed, by construction.)\n",
+            n_before_prune, n_bus_after, state$n_over, state$n_unreach))
+```
+
+### Selected corridors as a table
+
+```{r selected-table}
+`%||%` <- function(a, b) if (is.null(a) || is.na(a)) b else a
+
+selected_df <- bind_rows(lapply(seq_along(selected_corridors), function(s) {
+  c <- selected_corridors[[s]]
+  data.frame(
+    rank             = s,
+    type             = c$type,
+    label            = c$label,
+    n_nodes          = length(c$sequence),
+    n_transfer_stops = c$n_transfer_stops %||% 0L,
+    path_length_min  = c$path_length_min  %||% NA_real_,
+    travel_time_min  = c$travel_time_min  %||%
+                        (if (length(c$cum_t) > 0L) tail(c$cum_t, 1) else NA_real_),
+    detour_ratio     = c$detour_ratio     %||% NA_real_,
+    marginal_demand  = c$marginal_demand,
+    sequence_cells   = paste(node_info$cell_id[c$sequence], collapse = " → ")
+  )
+}))
+selected_df
+```
+## Final corridor network map
+
+## Save the corridor design
+
+```{r save-corridors}
+saveRDS(
+  list(
+    nodes                 = node_info,
+    demand_matrix         = W,
+    candidates            = candidates,
+    selected_corridors    = selected_corridors,
+    service_time_matrix   = state$service,
+    quality_matrix        = state$quality,
+    penalty_per_pair      = state$per_pair,
+    penalty_total         = state$penalty_total,
+    n_over_threshold      = state$n_over,
+    n_unreachable         = state$n_unreach,
+    max_detour_ratio      = params$max_detour_ratio,
+    max_corridor_nodes    = params$max_corridor_nodes,
+    safety_cap            = params$n_bus_corridors,
+    transfer_penalty_min  = params$transfer_penalty_min,
+    quality_threshold_pct = params$quality_threshold_pct,
+    unreachable_quality   = params$unreachable_quality
+  ),
+  file.path(params$out_dir, "corridor_design.rds")
+)
+
+fwrite(selected_df,
+       file.path(params$out_dir, "corridor_design_selected.csv"))
+
+# Top pairs by *remaining penalty* (worst-served high-demand pairs).
+# This is the "limitations" paragraph in the thesis — pairs the design
+# can't quite reach to threshold, ranked by demand-weighted excess.
+worst_pairs_df <- as.data.frame(as.table(state$per_pair)) %>%
+  rename(node_a = Var1, node_b = Var2, penalty = Freq) %>%
+  filter(as.integer(as.character(node_a)) < as.integer(as.character(node_b)),
+         penalty > 0) %>%
+  arrange(desc(penalty)) %>%
+  head(20) %>%
+  mutate(
+    # Translate cell_id (e.g., 386) → row/column position (1..n_nodes)
+    pa = match(as.character(node_a), as.character(node_info$cell_id)),
+    pb = match(as.character(node_b), as.character(node_info$cell_id)),
+    quality = state$quality[cbind(pa, pb)],
+    demand  = W[cbind(pa, pb)]
+  ) %>%
+  select(-pa, -pb)
+worst_pairs_df
+```
+
+## Export: GTFS feed + shapefile for ArcGIS
+
+GTFS contains only the **bus corridors** (the rail lines stay in their
+source feeds at `40_gtfs.zip` / `96_gtfs.zip` — load them alongside this
+one). Shapefile contains *all* selected corridors (bus + rail) plus the
+node points.
+
+Schedule conventions match your other generated feeds:
+
+- 30 s dwell at every stop
+- 2.5 min headway during the day (06:00 – 22:00)
+- 5 min headway at night (22:00 – 01:00 next day)
+- Mon–Fri service
+
+```{r export-params}
+gtfs_dir   <- file.path(params$out_dir, "gtfs_node_bus")
+gtfs_zip   <- file.path(params$gtfs_out_dir, "gtfs_node_bus.zip")
+shp_routes <- file.path(params$out_dir, "corridors_routes.shp")
+shp_stops  <- file.path(params$out_dir, "corridors_stops.shp")
+
+dir.create(gtfs_dir, showWarnings = FALSE, recursive = TRUE)
+
+dwell_sec          <- as.integer(params$express_dwell_sec)
+day_start          <- "05:00:00"
+day_end            <- "22:00:00"
+day_headway_sec    <- 120L      # 2 min
+night_start        <- "22:00:00"
+night_end          <- "29:00:00"  # 1 AM next service day (GTFS allows >24h)
+night_headway_sec  <- 360L      # 6 min
+
+service_start_date <- "20260101"
+service_end_date   <- "20261231"
+
+sec_to_gtfs <- function(s) {
+  s <- as.integer(round(s))
+  sprintf("%02d:%02d:%02d", s %/% 3600L, (s %% 3600L) %/% 60L, s %% 60L)
+}
+```
+
+### Build GTFS tables
+
+```{r build-gtfs-tables}
+bus_corridors <- Filter(function(c) c$type == "bus", selected_corridors)
+n_bus <- length(bus_corridors)
+cat(sprintf("Generating GTFS for %d bus corridors\n", n_bus))
+
+# agency.txt
+agency_df <- data.frame(
+  agency_id       = "NodeNet",
+  agency_name     = "Node-Based Network",
+  agency_url      = "https://example.org/node-net",
+  agency_timezone = "America/Los_Angeles",
+  stringsAsFactors = FALSE
+)
+
+# calendar.txt — weekday service
+calendar_df <- data.frame(
+  service_id = "WEEKDAY",
+  monday     = 1L, tuesday = 1L, wednesday = 1L, thursday = 1L, friday = 1L,
+  saturday   = 0L, sunday  = 0L,
+  start_date = service_start_date,
+  end_date   = service_end_date,
+  stringsAsFactors = FALSE
+)
+
+# stops.txt — p-median nodes + transfer points
+stop_id_for_full_idx <- function(idx) {
+  if (idx <= n_nodes) {
+    sprintf("N%03d", node_info$cell_id[idx])
+  } else {
+    sprintf("TP%03d", idx - n_nodes)
+  }
+}
+
+stops_df <- rbind(
+  data.frame(
+    stop_id   = sprintf("N%03d", node_info$cell_id),
+    stop_name = sprintf("Node cell %d", node_info$cell_id),
+    stop_lat  = round(node_info$lat, 7),
+    stop_lon  = round(node_info$lon, 7),
+    stringsAsFactors = FALSE
+  ),
+  if (n_transfer > 0L)
+    data.frame(
+      stop_id   = sprintf("TP%03d", seq_len(n_transfer)),
+      stop_name = sprintf("Transfer: %s", transfer_info$name),
+      stop_lat  = round(transfer_info$lat, 7),
+      stop_lon  = round(transfer_info$lon, 7),
+      stringsAsFactors = FALSE
+    )
+  else
+    data.frame(stop_id = character(0), stop_name = character(0),
+               stop_lat = numeric(0), stop_lon = numeric(0),
+               stringsAsFactors = FALSE)
+)
+
+# routes.txt — one per bus corridor
+make_route_id <- function(i) sprintf("BUS%03d", i)
+
+routes_df <- data.frame(
+  route_id         = vapply(seq_len(n_bus), make_route_id, character(1)),
+  agency_id        = "NodeNet",
+  route_short_name = vapply(bus_corridors, `[[`, character(1), "label"),
+  route_long_name  = vapply(bus_corridors, function(c) {
+    paste(node_info$cell_id[c$sequence], collapse = " ↔ ")
+  }, character(1)),
+  route_type       = 3L,           # 3 = bus
+  route_color      = "0066AA",
+  route_text_color = "FFFFFF",
+  stringsAsFactors = FALSE
+)
+
+# Build trip/stop_times/shape/frequency tables, per corridor × direction
+shape_coords_for_bus <- function(seq_v) {
+  chunks <- list()
+  for (k in seq_len(length(seq_v) - 1)) {
+    vids <- all_paths[[seq_v[k]]][[seq_v[k + 1]]]
+    cc <- path_to_coords(vids)
+    if (is.null(cc)) next
+    if (k > 1 && nrow(cc) >= 2) cc <- cc[-1, , drop = FALSE]
+    chunks[[length(chunks) + 1]] <- cc
+  }
+  if (length(chunks) == 0) return(NULL)
+  do.call(rbind, chunks)
+}
+
+trips_list      <- list()
+stop_times_list <- list()
+shapes_list     <- list()
+freq_list       <- list()
+
+# ---- shared street-derived stop-time model (same as grid + local; freeway-safe via OSM fallback) ----
+# dodgr still FINDS the corridor paths above; here we re-TIME them with the shared model so the
+# express output matches every other network. (Enumeration/scoring still use dodgr T_full_min.)
+source("BusStopTimeModel.R")
+gst_p <- gst_default_params(list(
+  crs_work = params$planar_crs, stop_route_buffer_ft = 700,
+  signals_gpkg = "data/public/sdot/traffic_signals.gpkg",
+  alllanes_geojson = "outputs/streets/street_grid.geojson"))
+gst_routes <- do.call(rbind, lapply(seq_len(n_bus), function(i) {
+  co <- shape_coords_for_bus(bus_corridors[[i]]$sequence)
+  if (is.null(co) || nrow(co) < 2) return(NULL)
+  sf::st_sf(rid = make_route_id(i), geometry = sf::st_sfc(sf::st_linestring(co[, 1:2]), crs = 4326))
+}))
+gst_stops   <- sf::st_as_sf(stops_df, coords = c("stop_lon", "stop_lat"), crs = 4326, remove = FALSE)
+gst_refs    <- gst_load_refs(gst_p)
+gst_prepped <- gst_prep(gst_routes, gst_refs, gst_p)
+gst_stops   <- gst_classify_stops(gst_stops, gst_prepped, gst_refs, gst_p)
+cat(sprintf("Express timing via shared model: %d corridors, %d stops, %.0f%% signalized\n",
+            nrow(gst_routes), nrow(gst_stops), 100 * mean(gst_stops$signalized)))
+
+for (i in seq_len(n_bus)) {
+  c        <- bus_corridors[[i]]
+  route_id <- make_route_id(i)
+  seq_v    <- c$sequence
+  shape_id <- sprintf("SBUS%03d", i)
+
+  # Shape geometry (same for both directions — GTFS doesn't require reversed shapes)
+  shape_coords <- shape_coords_for_bus(seq_v)
+  if (is.null(shape_coords)) {
+    warning("No shape coords for ", route_id, " — skipping")
+    next
+  }
+  shapes_list[[length(shapes_list) + 1]] <- data.frame(
+    shape_id          = shape_id,
+    shape_pt_lat      = round(shape_coords[, 2], 7),
+    shape_pt_lon      = round(shape_coords[, 1], 7),
+    shape_pt_sequence = seq_len(nrow(shape_coords)),
+    stringsAsFactors  = FALSE
+  )
+
+  # full_seq includes p-median nodes AND any transfer points within buffer
+  full_seq_fwd <- c$full_seq
+  if (is.null(full_seq_fwd) || length(full_seq_fwd) < 2L) {
+    warning("Corridor ", route_id, " has no full_seq — falling back to sequence")
+    full_seq_fwd <- c$sequence
+  }
+
+  # stop_times from the SHARED model on the dodgr-found path (free-flow speeds incl. OSM freeway
+  # fallback, signal/gap-acceptance dwell, accel/decel). Falls back to the dodgr T_full_min matrix
+  # + flat dwell only if a corridor can't be timed by the model.
+  cand_ids <- unique(vapply(full_seq_fwd, stop_id_for_full_idx, character(1)))
+  res <- if (route_id %in% gst_routes$rid)
+    gst_route_stop_times(route_id, gst_routes[gst_routes$rid == route_id, ],
+                         gst_stops[gst_stops$stop_id %in% cand_ids, ], gst_prepped, gst_p) else NULL
+  if (!is.null(res)) {
+    stop_times_list[[length(stop_times_list) + 1]] <- res$st0
+    stop_times_list[[length(stop_times_list) + 1]] <- res$st1
+  }
+
+  for (dir in 0:1) {
+    full_seq_dir <- if (dir == 0L) full_seq_fwd else rev(full_seq_fwd)
+    trip_id <- sprintf("%s_d%d", route_id, dir)
+
+    trips_list[[length(trips_list) + 1]] <- data.frame(
+      route_id     = route_id,
+      service_id   = "WEEKDAY",
+      trip_id      = trip_id,
+      shape_id     = shape_id,
+      direction_id = as.integer(dir),
+      stringsAsFactors = FALSE
+    )
+
+    if (is.null(res)) {   # fallback: dodgr T_full_min between consecutive stops + flat dwell
+      arr <- 0L; dep <- arr + dwell_sec
+      rows <- list()
+      rows[[1]] <- data.frame(
+        trip_id = trip_id, arrival_time = sec_to_gtfs(arr), departure_time = sec_to_gtfs(dep),
+        stop_id = stop_id_for_full_idx(full_seq_dir[1]), stop_sequence = 1L, stringsAsFactors = FALSE)
+      for (k in 2:length(full_seq_dir)) {
+        travel_sec <- round(T_full_min[full_seq_dir[k - 1], full_seq_dir[k]] * 60)
+        arr <- dep + travel_sec; dep <- arr + dwell_sec
+        rows[[k]] <- data.frame(
+          trip_id = trip_id, arrival_time = sec_to_gtfs(arr), departure_time = sec_to_gtfs(dep),
+          stop_id = stop_id_for_full_idx(full_seq_dir[k]), stop_sequence = as.integer(k), stringsAsFactors = FALSE)
+      }
+      stop_times_list[[length(stop_times_list) + 1]] <- bind_rows(rows)
+    }
+
+    # Frequencies — day band + night band
+    freq_list[[length(freq_list) + 1]] <- data.frame(
+      trip_id      = trip_id,
+      start_time   = c(day_start, night_start),
+      end_time     = c(day_end,   night_end),
+      headway_secs = c(day_headway_sec, night_headway_sec),
+      exact_times  = 0L,
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+trips_df      <- bind_rows(trips_list)
+stop_times_df <- bind_rows(stop_times_list)
+shapes_df     <- bind_rows(shapes_list)
+freq_df       <- bind_rows(freq_list)
+
+data.frame(
+  table = c("agency", "routes", "stops", "trips", "stop_times",
+            "shapes", "calendar", "frequencies"),
+  rows  = c(nrow(agency_df), nrow(routes_df), nrow(stops_df),
+            nrow(trips_df), nrow(stop_times_df), nrow(shapes_df),
+            nrow(calendar_df), nrow(freq_df))
+)
+```
+
+### Write GTFS feed + zip
+
+```{r write-gtfs}
+fwrite(agency_df,     file.path(gtfs_dir, "agency.txt"))
+fwrite(routes_df,     file.path(gtfs_dir, "routes.txt"))
+fwrite(stops_df,      file.path(gtfs_dir, "stops.txt"))
+fwrite(trips_df,      file.path(gtfs_dir, "trips.txt"))
+fwrite(stop_times_df, file.path(gtfs_dir, "stop_times.txt"))
+fwrite(calendar_df,   file.path(gtfs_dir, "calendar.txt"))
+fwrite(shapes_df,     file.path(gtfs_dir, "shapes.txt"))
+fwrite(freq_df,       file.path(gtfs_dir, "frequencies.txt"))
+
+if (file.exists(gtfs_zip)) unlink(gtfs_zip)
+# Pure-R zip (the external `zip` program isn't on PATH on Windows, so
+# utils::zip() silently produced no archive). setwd into the feed dir +
+# relative file names makes the .txt files sit at the archive root (GTFS
+# requires a flat archive); zip::zip's `root=` arg did NOT flatten here.
+gtfs_zip_abs <- file.path(normalizePath(dirname(gtfs_zip)), basename(gtfs_zip))
+old_wd <- setwd(gtfs_dir)
+tryCatch(zip::zip(zipfile = gtfs_zip_abs, files = list.files(".")),
+         finally = setwd(old_wd))
+cat(sprintf("GTFS feed: %s\n", normalizePath(gtfs_zip)))
+```
+
+### Write shapefiles (routes + stops) for ArcGIS
+
+```{r write-shapefiles}
+shape_coords_for_rail <- function(rc) {
+  cell_ids <- rc$corridor_cells$cell_id
+  grid_demand %>%
+    filter(cell_id %in% cell_ids) %>%
+    arrange(match(cell_id, cell_ids)) %>%
+    st_centroid() %>%
+    st_transform(4326) %>%
+    st_coordinates()
+}
+
+rail_labels <- vapply(rail_corridors, `[[`, character(1), "route_short_name")
+
+route_rows <- list()
+for (s in seq_along(selected_corridors)) {
+  c     <- selected_corridors[[s]]
+  seq_v <- c$sequence
+  if (length(seq_v) < 2L) next
+
+  if (c$type == "rail") {
+    rc_idx <- match(c$label, rail_labels)
+    if (is.na(rc_idx)) next
+    coords <- shape_coords_for_rail(rail_corridors[[rc_idx]])
+  } else {
+    coords <- shape_coords_for_bus(seq_v)
+  }
+
+  if (is.null(coords) || nrow(coords) < 2L) next
+
+  route_rows[[length(route_rows) + 1]] <- list(
+    rank      = s,
+    type      = c$type,
+    label     = c$label,
+    n_node    = length(seq_v),
+    n_tp_stop = (c$n_transfer_stops %||% 0L),
+    travel_min = (c$travel_time_min %||% c$path_length_min %||% NA_real_),
+    detour    = c$detour_ratio %||% NA_real_,
+    geom      = st_linestring(coords)
+  )
+}
+
+routes_shp <- st_sf(
+  rank       = vapply(route_rows, `[[`, integer(1),   "rank"),
+  type       = vapply(route_rows, `[[`, character(1), "type"),
+  label      = vapply(route_rows, `[[`, character(1), "label"),
+  n_node     = vapply(route_rows, `[[`, integer(1),   "n_node"),
+  n_tp_stop  = vapply(route_rows, `[[`, integer(1),   "n_tp_stop"),
+  travel_min = vapply(route_rows, `[[`, numeric(1),   "travel_min"),
+  detour     = vapply(route_rows, `[[`, numeric(1),   "detour"),
+  geometry   = st_sfc(lapply(route_rows, `[[`, "geom"), crs = 4326)
+)
+
+# Stops shapefile: p-median nodes + transfer points, with a `kind` column
+stops_shp <- rbind(
+  st_as_sf(
+    data.frame(
+      stop_id  = sprintf("N%03d", node_info$cell_id),
+      kind     = "node",
+      name     = sprintf("Node cell %d", node_info$cell_id),
+      cell_id  = node_info$cell_id,
+      lon      = node_info$lon,
+      lat      = node_info$lat,
+      stringsAsFactors = FALSE
+    ),
+    coords = c("lon", "lat"), crs = 4326
+  ),
+  if (n_transfer > 0L)
+    st_as_sf(
+      data.frame(
+        stop_id = sprintf("TP%03d", seq_len(n_transfer)),
+        kind    = "transfer",
+        name    = transfer_info$name,
+        cell_id = NA_integer_,
+        lon     = transfer_info$lon,
+        lat     = transfer_info$lat,
+        stringsAsFactors = FALSE
+      ),
+      coords = c("lon", "lat"), crs = 4326
+    )
+  else NULL
+)
+
+# Clean up any old shapefile siblings (.shp/.shx/.dbf/.prj/.cpg) before writing
+for (base in c(tools::file_path_sans_ext(shp_routes),
+               tools::file_path_sans_ext(shp_stops))) {
+  for (ext in c(".shp", ".shx", ".dbf", ".prj", ".cpg")) {
+    f <- paste0(base, ext)
+    if (file.exists(f)) unlink(f)
+  }
+}
+
+st_write(routes_shp, shp_routes, append = FALSE, quiet = TRUE)
+st_write(stops_shp,  shp_stops,  append = FALSE, quiet = TRUE)
+
+cat(sprintf("Shapefiles:\n  %s\n  %s\n",
+            normalizePath(shp_routes),
+            normalizePath(shp_stops)))
+```
+
+# Part 3 — Local feeder routes
+
+### Goal
+
+Design local feeder routes that bring ~1200 stops to the 12 express nodes.
+
+- **Frequent stops** (`frequent_stops.shp`) — **must** be served.
+- **Local stops** (`local_stops.shp`) — served best-effort.
+
+A stop is *served* if it's within `walk_dist_ft` of a route whose path passes
+through a node. Routes run on arterials (residential penalized) and pass
+**through** nodes (serving stops on both sides), not terminating at them.
+
+### Load stops
+
+```{r load-stops}
+read_stops <- function(path, kind) {
+  s <- sf::st_read(path, quiet = TRUE) %>% sf::st_transform(params$planar_crs)
+  s$kind <- kind
+  s$stop_uid <- sprintf("%s_%04d", substr(kind, 1, 1), seq_len(nrow(s)))
+  s[, c("stop_uid", "kind")]
+}
+
+freq_sf  <- read_stops(params$frequent_stops_shp, "frequent")
+local_sf <- read_stops(params$local_stops_shp,    "local")
+
+stops_sf <- rbind(freq_sf, local_sf)
+stops_4326 <- sf::st_transform(stops_sf, 4326)
+stops_xy   <- sf::st_coordinates(stops_4326)
+colnames(stops_xy) <- c("x", "y")
+
+n_stops <- nrow(stops_sf)
+cat(sprintf("Loaded %d stops: %d frequent (mandatory), %d local (optional)\n",
+            n_stops, sum(stops_sf$kind == "frequent"), sum(stops_sf$kind == "local")))
+```
+
+### Load nodes
+
+```{r load-nodes}
+cd <- readRDS(params$corridor_design_rds)
+node_info <- cd$nodes          # cell_id, vertex_id, lon, lat, ...
+n_nodes   <- nrow(node_info)
+cat(sprintf("Loaded %d express nodes\n", n_nodes))
+node_info[, c("cell_id", "lon", "lat")]
+```
+
+### Arterial-preferring graph
+
+Penalize residential / service / living_street so routing prefers arterials but
+can still reach an isolated frequent stop when there's no arterial nearby.
+
+```{r local-build-graph}
+graph <- readRDS(params$graph_rds)
+
+# Clip to Seattle + buffer. The cached graph covers the whole PSRC 4-county
+# area (millions of edges); local routing only needs Seattle, and a per-source
+# Dijkstra over the full graph is what made the spoke step crawl (~16s each).
+all_lon <- c(stops_xy[, "x"], node_info$lon)
+all_lat <- c(stops_xy[, "y"], node_info$lat)
+buf <- 0.03   # ~2 mi in degrees
+keep_edge <-
+  graph$from_lon >= min(all_lon) - buf & graph$from_lon <= max(all_lon) + buf &
+  graph$from_lat >= min(all_lat) - buf & graph$from_lat <= max(all_lat) + buf &
+  graph$to_lon   >= min(all_lon) - buf & graph$to_lon   <= max(all_lon) + buf &
+  graph$to_lat   >= min(all_lat) - buf & graph$to_lat   <= max(all_lat) + buf
+cat(sprintf("Clipping graph to Seattle bbox: %d → %d edges\n",
+            nrow(graph), sum(keep_edge)))
+graph <- graph[keep_edge, , drop = FALSE]
+
+# Drop `service` highways (alleys, parking-lot access, driveways) entirely —
+# same convention as GenerateNodeGTFS / Phase2RunSimulation: service
+# edges add routing noise, rarely serve through-traffic, and have caused perf
+# and correctness problems on this project before.
+if ("highway" %in% colnames(graph)) {
+  n_before <- nrow(graph)
+  graph    <- graph[as.character(graph$highway) != "service", , drop = FALSE]
+  cat(sprintf("Dropped service edges: %d → %d (%d removed)\n",
+              n_before, nrow(graph), n_before - nrow(graph)))
+} else {
+  warning("Graph has no `highway` column — service filter skipped.")
+}
+
+# Largest connected component (recompute AFTER dropping service — removal can
+# orphan pieces that were only reachable through an alley/driveway).
+graph <- dodgr::dodgr_components(graph)
+graph <- graph[graph$component == 1L, , drop = FALSE]
+
+# Penalize remaining non-arterial classes (kept, unlike service: a feeder may
+# need a residential street to reach an isolated frequent stop when no arterial
+# is nearby). dodgr_times uses time_weighted; dodgr_paths uses d_weighted —
+# penalize both so paths AND times prefer arterials.
+penalize <- c("residential", "living_street", "unclassified")
+is_pen <- as.character(graph$highway) %in% penalize
+cat(sprintf("Penalizing %d / %d edges (residential/living_street/unclassified) ×%g\n",
+            sum(is_pen), nrow(graph), params$residential_penalty))
+graph$d_weighted[is_pen]    <- graph$d_weighted[is_pen]    * params$residential_penalty
+graph$time_weighted[is_pen] <- graph$time_weighted[is_pen] * params$residential_penalty
+
+graph_v     <- dodgr::dodgr_vertices(graph)
+v_idx_by_id <- setNames(seq_len(nrow(graph_v)), graph_v$id)
+
+path_to_coords <- function(vertex_ids) {
+  if (is.null(vertex_ids) || length(vertex_ids) < 2) return(NULL)
+  idx <- v_idx_by_id[as.character(vertex_ids)]
+  idx <- idx[!is.na(idx)]
+  if (length(idx) < 2) return(NULL)
+  cbind(graph_v$x[idx], graph_v$y[idx])
+}
+```
+
+### Snap nodes and stops to the graph
+
+```{r snap}
+node_lonlat <- as.data.frame(node_info[, c("lon", "lat")])
+colnames(node_lonlat) <- c("x", "y")
+node_vert <- graph_v$id[dodgr::match_pts_to_verts(graph_v, node_lonlat, connected = TRUE)]
+
+stop_vert <- graph_v$id[dodgr::match_pts_to_verts(graph_v, as.data.frame(stops_xy),
+                                                  connected = TRUE)]
+
+cat(sprintf("Snapped %d nodes and %d stops to graph vertices\n", n_nodes, n_stops))
+```
+
+### Stop → node assignment
+
+```{r assign}
+# Travel time (penalized minutes) from every node to every stop
+T_node_stop <- dodgr::dodgr_times(graph, from = node_vert, to = stop_vert) / 60
+# rows = nodes, cols = stops
+
+# For each stop, nearest node + any within dual_assign_ratio × nearest
+assign_list <- vector("list", n_stops)
+for (s in seq_len(n_stops)) {
+  ts <- T_node_stop[, s]
+  if (all(!is.finite(ts))) { assign_list[[s]] <- integer(0); next }
+  best <- min(ts, na.rm = TRUE)
+  assign_list[[s]] <- which(is.finite(ts) & ts <= params$dual_assign_ratio * best)
+}
+
+n_unreach <- sum(lengths(assign_list) == 0L)
+cat(sprintf("Stops with ≥1 reachable node: %d / %d  (unreachable: %d)\n",
+            n_stops - n_unreach, n_stops, n_unreach))
+cat(sprintf("Stops assigned to 2+ nodes (between-node): %d\n",
+            sum(lengths(assign_list) >= 2L)))
+```
+
+### Spoke generation (per node)
+
+For each node, greedily cover its assigned stops with radial arterial paths:
+route node → farthest uncovered assigned stop, mark everything within walkshed
+of that path covered, repeat. Each path is a spoke with a bearing.
+
+```{r spokes}
+walk_ft <- params$walk_dist_ft
+
+# Helper: which stops are within walk_dist of a path. st_distance on the
+# projected CRS (EPSG:2926, US feet) returns feet, so compare to walk_ft.
+stops_planar_geom <- sf::st_geometry(stops_sf)
+covered_by_path <- function(coords_lonlat) {
+  if (is.null(coords_lonlat) || nrow(coords_lonlat) < 2) return(integer(0))
+  line <- sf::st_linestring(coords_lonlat) |>
+    sf::st_sfc(crs = 4326) |> sf::st_transform(params$planar_crs)
+  d <- as.numeric(sf::st_distance(stops_planar_geom, line))
+  which(d <= walk_ft)
+}
+
+bearing_deg <- function(lon1, lat1, lon2, lat2)
+  (atan2(lon2 - lon1, lat2 - lat1) * 180 / pi) %% 360
+
+spokes <- list()   # each: node_idx, endpoint, bearing, vseq, coords, covered
+
+cat(sprintf("Spoke generation over %d nodes:\n", n_nodes))
+t_all <- Sys.time()
+
+for (ni in seq_len(n_nodes)) {
+  mine <- which(vapply(assign_list, function(a) ni %in% a, logical(1)))
+  if (length(mine) == 0L) {
+    cat(sprintf("  [%2d/%d] cell %d: 0 stops\n", ni, n_nodes, node_info$cell_id[ni]))
+    next
+  }
+
+  t_node <- Sys.time()
+  # ONE batched dodgr_paths call: this node → all its assigned stops (one
+  # Dijkstra, extract all paths). Was previously one call PER spoke — that's
+  # what made this hang. dodgr returns the inner list in the SAME ORDER as
+  # `to` (1:1, duplicates preserved, NOT deduped) and names it "from-to", so
+  # index it positionally by where `far` sits within `mine` — never by vertex id.
+  node_paths <- dodgr::dodgr_paths(graph, from = node_vert[ni],
+                                   to = stop_vert[mine], vertices = TRUE)[[1]]
+
+  covered <- logical(n_stops)
+  n_sp <- 0L
+  repeat {
+    remaining <- mine[!covered[mine]]
+    if (length(remaining) == 0L) break
+    far  <- remaining[which.max(T_node_stop[ni, remaining])]
+    vseq <- node_paths[[ match(far, mine) ]]
+    if (is.null(vseq) || length(vseq) < 2L) { covered[far] <- TRUE; next }
+    coords   <- path_to_coords(vseq)
+    cov      <- covered_by_path(coords)
+    cov_mine <- intersect(cov, mine)
+    if (length(cov_mine) == 0L) cov_mine <- far   # ensure progress
+    covered[cov_mine] <- TRUE
+    n_sp <- n_sp + 1L
+    spokes[[length(spokes) + 1]] <- list(
+      node_idx = ni, endpoint = far,
+      bearing  = bearing_deg(node_info$lon[ni], node_info$lat[ni],
+                             stops_xy[far, "x"], stops_xy[far, "y"]),
+      vseq = vseq, coords = coords, covered = cov
+    )
+  }
+  cat(sprintf("  [%2d/%d] cell %d: %d stops → %d spokes (%.1fs)\n",
+              ni, n_nodes, node_info$cell_id[ni], length(mine), n_sp,
+              as.numeric(Sys.time() - t_node, units = "secs")))
+}
+
+cat(sprintf("Total: %d spokes in %.1f s\n",
+            length(spokes), as.numeric(Sys.time() - t_all, units = "secs")))
+```
+
+### Candidate routes (spokes, through-routes, multi-node through-lines)
+
+Three kinds of candidate, all built from the per-node spokes:
+
+- **spoke** — an unpaired radial (only where nothing pairs with it).
+- **through** — two opposite spokes at one node, joined (serves both sides of a node).
+- **line** — a *multi-node through-line*: a neighborhood tail, in through node A,
+  along the A→B arterial path (passing any nodes on the way), out to a neighborhood
+  tail beyond B. This is what lets a stop ride *through* a hub to the far side.
+
+For every candidate we also record the nodes its path passes **through** (within
+`node_on_route_buffer_ft`) — those are the transfer points a rider on the route can
+reach, and the travel-time objective in the next step picks the best one per stop.
+
+```{r candidates}
+join_vseq <- function(vseq_a, vseq_b) c(rev(vseq_a), vseq_b[-1])
+
+# Planar node points, for "which nodes does this path pass through" detection.
+node_pts_planar <- sf::st_geometry(
+  sf::st_transform(
+    sf::st_as_sf(node_info[, c("lon", "lat")], coords = c("lon", "lat"), crs = 4326),
+    params$planar_crs))
+nodes_on_route <- function(coords) {
+  if (is.null(coords) || nrow(coords) < 2) return(integer(0))
+  line <- sf::st_linestring(coords) |> sf::st_sfc(crs = 4326) |>
+    sf::st_transform(params$planar_crs)
+  which(as.numeric(sf::st_distance(node_pts_planar, line)) <= params$node_on_route_buffer_ft)
+}
+
+candidates <- list()
+add_cand <- function(type, vseq, design_nodes) {
+  coords <- path_to_coords(vseq)
+  if (is.null(coords) || nrow(coords) < 2) return(invisible(NULL))
+  candidates[[length(candidates) + 1]] <<- list(
+    type = type, vseq = vseq, coords = coords,
+    covered = covered_by_path(coords),
+    nodes   = sort(union(design_nodes, nodes_on_route(coords)))   # always incl. design nodes
+  )
+}
+
+# --- Single-node: paired through-routes + leftover spokes ---
+for (ni in seq_len(n_nodes)) {
+  idx <- which(vapply(spokes, `[[`, integer(1), "node_idx") == ni)
+  if (length(idx) == 0L) next
+  paired <- rep(FALSE, length(idx))
+  for (a in seq_along(idx)) {
+    if (paired[a]) next
+    best_b <- NA_integer_; best_diff <- Inf
+    for (b in seq_along(idx)) {
+      if (b == a || paired[b]) next
+      d <- abs(((spokes[[idx[a]]]$bearing - spokes[[idx[b]]]$bearing) %% 360) - 180)
+      if (d < best_diff) { best_diff <- d; best_b <- b }
+    }
+    if (!is.na(best_b) && best_diff <= params$pair_bearing_tol) {
+      paired[a] <- TRUE; paired[best_b] <- TRUE
+      add_cand("through", join_vseq(spokes[[idx[a]]]$vseq, spokes[[idx[best_b]]]$vseq), ni)
+    } else {
+      paired[a] <- TRUE
+      add_cand("spoke", spokes[[idx[a]]]$vseq, ni)
+    }
+  }
+}
+
+# --- Multi-node through-lines: tail(A, away from B) + path(A→B) + tail(B, away from A) ---
+cat("Building multi-node through-lines (1 batched dodgr call)...\n")
+nn_paths <- dodgr::dodgr_paths(graph, from = node_vert, to = node_vert, vertices = TRUE)
+
+# best spoke at node `nd` whose bearing is within tol of `want` (the outward dir)
+outward_spoke <- function(nd, want) {
+  idx <- which(vapply(spokes, `[[`, integer(1), "node_idx") == nd)
+  if (length(idx) == 0L) return(NULL)
+  d <- vapply(idx, function(k)
+    abs(((spokes[[k]]$bearing - want) %% 360 + 180) %% 360 - 180), numeric(1))
+  if (min(d) > params$pair_bearing_tol) return(NULL)
+  spokes[[idx[which.min(d)]]]
+}
+
+for (a in seq_len(n_nodes - 1)) {
+  for (b in (a + 1):n_nodes) {
+    spine <- nn_paths[[a]][[b]]
+    if (is.null(spine) || length(spine) < 2L) next
+    bear_ab <- bearing_deg(node_info$lon[a], node_info$lat[a],
+                           node_info$lon[b], node_info$lat[b])
+    ta <- outward_spoke(a, (bear_ab + 180) %% 360)   # tail at A points away from B
+    tb <- outward_spoke(b, bear_ab)                  # tail at B points away from A
+    vseq <- spine
+    if (!is.null(ta)) vseq <- c(rev(ta$vseq), vseq[-1])
+    if (!is.null(tb)) vseq <- c(vseq, tb$vseq[-1])
+    add_cand("line", vseq, c(a, b))
+  }
+}
+
+cat(sprintf("Candidate local routes: %d\n", length(candidates)))
+print(table(type = vapply(candidates, `[[`, character(1), "type")))
+print(table(nodes_passed = vapply(candidates, function(c) length(c$nodes), integer(1))))
+```
+
+### Route cost — best access to each node + onward time
+
+Two precomputed pieces feed the optimizer:
+
+- `a_sn[s, n]` — the **best along-route ride time** from stop `s` to node `n`,
+  over every candidate that covers `s` and passes through `n`. If the network
+  selects any such route, the stop can reach `n` in about this time.
+- `p(s, d)` — stop `s`'s destination distribution, from its home area's outbound
+  demand. Express leg `S(n, d)` (+ a transfer unless `n == d`) is the express design.
+
+The optimizer then lets each stop's trip to `d` use the best node it can reach
+**across all selected routes that serve it** — so a boundary stop reached by two
+routes (or one through-line) can ride each direction the way that's fastest.
+
+```{r route-cost}
+S <- cd$service_time_matrix
+S[!is.finite(S)] <- max(S[is.finite(S)], na.rm = TRUE)   # cap unreachable express pairs
+D <- cd$demand_matrix
+
+bus_speed_fpm  <- params$bus_speed_mph * 5280 / 60
+transfer_pen   <- params$express_transfer_min
+access_cap_min <- 30        # ignore stop→node access slower than this (never the best option)
+
+line_planar <- function(coords) {
+  m <- sf::st_coordinates(sf::st_transform(
+    sf::st_sfc(sf::st_linestring(coords), crs = 4326), params$planar_crs))
+  m[, 1:2, drop = FALSE]
+}
+# arc-length (planar ft) of each point projected onto a polyline
+project_along <- function(pts_xy, line_xy) {
+  if (nrow(line_xy) < 2) return(rep(0, nrow(pts_xy)))
+  s0 <- line_xy[-nrow(line_xy), , drop = FALSE]; s1 <- line_xy[-1, , drop = FALSE]
+  sv <- s1 - s0; sl2 <- rowSums(sv^2); seglen <- sqrt(sl2); cum <- c(0, cumsum(seglen))
+  vapply(seq_len(nrow(pts_xy)), function(p) {
+    px <- pts_xy[p, 1]; py <- pts_xy[p, 2]
+    t <- ((px - s0[, 1]) * sv[, 1] + (py - s0[, 2]) * sv[, 2]) / pmax(sl2, 1e-9)
+    t <- pmin(pmax(t, 0), 1)
+    k <- which.min((s0[, 1] + t * sv[, 1] - px)^2 + (s0[, 2] + t * sv[, 2] - py)^2)
+    cum[k] + t[k] * seglen[k]
+  }, numeric(1))
+}
+# perpendicular distance (planar ft) of each point to a polyline (mirrors project_along)
+dist_to_line <- function(pts_xy, line_xy) {
+  if (nrow(line_xy) < 2) return(rep(Inf, nrow(pts_xy)))
+  s0 <- line_xy[-nrow(line_xy), , drop = FALSE]; s1 <- line_xy[-1, , drop = FALSE]
+  sv <- s1 - s0; sl2 <- rowSums(sv^2)
+  vapply(seq_len(nrow(pts_xy)), function(p) {
+    px <- pts_xy[p, 1]; py <- pts_xy[p, 2]
+    t <- ((px - s0[, 1]) * sv[, 1] + (py - s0[, 2]) * sv[, 2]) / pmax(sl2, 1e-9)
+    t <- pmin(pmax(t, 0), 1)
+    sqrt(min((s0[, 1] + t * sv[, 1] - px)^2 + (s0[, 2] + t * sv[, 2] - py)^2))
+  }, numeric(1))
+}
+
+stops_planar_xy <- sf::st_coordinates(stops_sf)            # X,Y planar
+node_planar_xy  <- sf::st_coordinates(sf::st_transform(
+  sf::st_as_sf(node_info[, c("lon", "lat")], coords = c("lon", "lat"), crs = 4326),
+  params$planar_crs))
+
+home_node <- max.col(-t(T_node_stop), ties.method = "first")
+Drow <- D[home_node, , drop = FALSE]
+rs <- rowSums(Drow); rs[rs == 0] <- 1
+P <- Drow / rs                                             # n_stops × n_nodes destination dist
+
+# Best access a_sn[s,n] (min ride over covering routes that pass n) + the
+# (stop, node, route) incidence used to link "stop reaches n" to route selection.
+# Also cand_onroute[[r]] = covered stops within on_route_buffer_ft of route r
+# (the route's PHYSICAL bus stops) — used for fleet weighting and export.
+a_sn <- matrix(Inf, n_stops, n_nodes)
+inc_list <- vector("list", 0)
+cand_onroute <- vector("list", length(candidates))
+on_route_ft  <- params$on_route_buffer_ft
+for (r in seq_along(candidates)) {
+  cand_onroute[[r]] <- integer(0)
+  cov <- candidates[[r]]$covered; Nr <- candidates[[r]]$nodes
+  if (length(cov) == 0L) next
+  lxy   <- line_planar(candidates[[r]]$coords)
+  cand_onroute[[r]] <- cov[dist_to_line(stops_planar_xy[cov, , drop = FALSE], lxy) <= on_route_ft]
+  arc_s <- project_along(stops_planar_xy[cov, , drop = FALSE], lxy)
+  arc_n <- project_along(node_planar_xy[Nr, , drop = FALSE], lxy)
+  for (m in seq_along(Nr)) {
+    ride <- abs(arc_s - arc_n[m]) / bus_speed_fpm
+    a_sn[cbind(cov, Nr[m])] <- pmin(a_sn[cbind(cov, Nr[m])], ride)
+    inc_list[[length(inc_list) + 1]] <- cbind(s = cov, n = Nr[m], r = r)
+  }
+}
+inc <- do.call(rbind, inc_list)
+a_sn[a_sn > access_cap_min] <- Inf                        # prune far (never-best) access
+cat(sprintf("Reachable (stop,node) pairs: %d | incidence rows: %d | mean on-route stops/cand: %.1f\n",
+            sum(is.finite(a_sn)), nrow(inc), mean(lengths(cand_onroute))))
+```
+
+### Travel-time ILP — reach all nearby nodes
+
+Choose routes `x`. A stop **reaches** node `n` if any selected route covering it
+passes `n` (`reach[s,n] ≤ Σ x` over those routes). Each stop→destination trip
+then uses the **best node it can reach** (`y[s,d,n]`) — across *all* its selected
+routes, riding direct when one reaches the destination's own node. Objective:
+minimize demand-weighted trip time `+ lambda_fleet × buses`, with optional local
+trips earning `local_served_reward`. Because reaching a second node cuts a
+boundary stop's trip time, the optimizer pays for the through-line (or second
+route) that delivers it — this is what closes the boundary gaps. Only the route
+on/off `x` are integer; `reach` and `y` come out integral on their own.
+
+```{r select-ilp}
+for (p in c("highs", "Matrix"))
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+suppressPackageStartupMessages({ library(highs); library(Matrix) })
+
+is_freq  <- stops_sf$kind == "frequent"
+cov_sets <- lapply(candidates, `[[`, "covered")
+N_cand   <- length(candidates)
+gamma    <- params$local_served_reward
+
+# Per-candidate peak bus requirement (matches the fleet diagnostic). Dwell is
+# charged only at ON-ROUTE stops (+ nodes) — walkshed-only stops aren't bus stops,
+# so they add no dwell. This keeps the selection's fleet weight consistent with
+# the GTFS the diagnostic measures (was overcounting dwell at all covered stops).
+cand_lines  <- sf::st_sfc(lapply(candidates, function(c) sf::st_linestring(c$coords)), crs = 4326)
+cand_len_ft <- as.numeric(sf::st_length(sf::st_transform(cand_lines, params$planar_crs)))
+n_stops_cand <- vapply(seq_len(N_cand), function(r)
+  length(cand_onroute[[r]]) + length(candidates[[r]]$nodes), integer(1))
+
+# Per-candidate one-way time from the SHARED street-derived model (same speeds + dwell as the GTFS
+# output), so route selection trades fleet on real running times — not a flat 30 mph / 20 s.
+sel_p <- gst_default_params(list(
+  crs_work = params$planar_crs, stop_route_buffer_ft = 700,
+  signals_gpkg = "data/public/sdot/traffic_signals.gpkg",
+  alllanes_geojson = "outputs/streets/street_grid.geojson"))
+sel_routes <- sf::st_sf(rid = sprintf("C%04d", seq_len(N_cand)), geometry = cand_lines)
+sel_stops  <- rbind(
+  sf::st_sf(stop_id  = stops_sf$stop_uid,
+            geometry = sf::st_transform(sf::st_geometry(stops_sf), params$planar_crs)),
+  sf::st_sf(stop_id  = sprintf("N%03d", node_info$cell_id),
+            geometry = sf::st_geometry(sf::st_transform(
+              sf::st_as_sf(node_info[, c("lon","lat")], coords = c("lon","lat"), crs = 4326),
+              params$planar_crs))))
+cat(sprintf("Candidate timing via shared model: %d candidates\n", N_cand))
+sel_refs    <- gst_load_refs(sel_p)
+sel_prepped <- gst_prep(sel_routes, sel_refs, sel_p)
+sel_stops   <- gst_classify_stops(sel_stops, sel_prepped, sel_refs, sel_p)
+one_way_min <- vapply(seq_len(N_cand), function(r) {
+  rsids <- unique(c(stops_sf$stop_uid[cand_onroute[[r]]],
+                    sprintf("N%03d", node_info$cell_id[candidates[[r]]$nodes])))
+  res <- gst_route_stop_times(sprintf("C%04d", r), sel_routes[r, ],
+                              sel_stops[sel_stops$stop_id %in% rsids, ], sel_prepped, sel_p)
+  if (is.null(res)) cand_len_ft[r] / bus_speed_fpm + n_stops_cand[r] * params$local_dwell_sec / 60
+  else res$runtime_s / 60
+}, numeric(1))
+buses_cand  <- pmax(1L, as.integer(ceiling(2 * one_way_min / params$local_day_headway_min)))
+
+# --- reach[s,n] vars: one per reachable (stop,node) pair ---
+rp <- which(is.finite(a_sn), arr.ind = TRUE)
+rp_s <- rp[, 1]; rp_n <- rp[, 2]; n_rn <- length(rp_s)
+reach_id <- matrix(0L, n_stops, n_nodes); reach_id[cbind(rp_s, rp_n)] <- seq_len(n_rn)
+
+# --- y[s,d,n] vars: reachable (s,n) × each destination d the stop has demand to ---
+Dlist  <- lapply(seq_len(n_stops), function(s) which(P[s, ] > 0))
+nd_per <- lengths(Dlist[rp_s])
+n_y    <- sum(nd_per)
+y_k    <- rep(seq_len(n_rn), nd_per)                 # reach-pair index per y
+y_s    <- rp_s[y_k]; y_n <- rp_n[y_k]
+y_d    <- unlist(Dlist[rp_s])
+c_y    <- a_sn[cbind(y_s, y_n)] + S[cbind(y_n, y_d)] + ifelse(y_n == y_d, 0, transfer_pen)
+p_y    <- P[cbind(y_s, y_d)]
+obj_y  <- p_y * (c_y - ifelse(is_freq[y_s], 0, gamma))
+
+nv <- N_cand + n_rn + n_y
+ix_reach <- N_cand + seq_len(n_rn)
+ix_y     <- N_cand + n_rn + seq_len(n_y)
+
+# Block 0: frequent coverage  Σ_n reach[s,n] ≥ 1
+fr_row <- integer(n_stops)
+fr_stops <- which(is_freq & (tabulate(rp_s, n_stops) > 0)); n_fr <- length(fr_stops)
+fr_row[fr_stops] <- seq_len(n_fr)
+sel0 <- fr_row[rp_s] > 0
+b0_i <- fr_row[rp_s][sel0]; b0_j <- ix_reach[which(sel0)]; b0_x <- rep(1, sum(sel0))
+
+# Block 1: reach[k] − Σ_{r covers s & passes n} x_r ≤ 0
+inc_k <- reach_id[cbind(inc[, "s"], inc[, "n"])]; keep <- inc_k > 0
+b1_i <- n_fr + c(seq_len(n_rn), inc_k[keep])
+b1_j <- c(ix_reach,             inc[keep, "r"])
+b1_x <- c(rep(1, n_rn),         rep(-1, sum(keep)))
+
+# Block 2: y[j] − reach[k(j)] ≤ 0
+b2_i <- n_fr + n_rn + rep(seq_len(n_y), 2)
+b2_j <- c(ix_y, ix_reach[y_k])
+b2_x <- c(rep(1, n_y), rep(-1, n_y))
+
+# Block 3: assignment Σ_n y[s,d,n]  (=1 frequent, ≤1 local), per (s,d)
+sd_key <- y_s * 100L + y_d
+sd_grp <- match(sd_key, unique(sd_key)); n_sd <- max(sd_grp)
+b3_i <- n_fr + n_rn + n_y + sd_grp; b3_j <- ix_y; b3_x <- rep(1, n_y)
+ug <- !duplicated(sd_grp); grp_stop <- integer(n_sd); grp_stop[sd_grp[ug]] <- y_s[ug]
+grp_lhs <- ifelse(is_freq[grp_stop], 1, -Inf); grp_rhs <- rep(1, n_sd)
+
+A <- Matrix::sparseMatrix(
+  i = c(b0_i, b1_i, b2_i, b3_i),
+  j = c(b0_j, b1_j, b2_j, b3_j),
+  x = c(b0_x, b1_x, b2_x, b3_x),
+  dims = c(n_fr + n_rn + n_y + n_sd, nv))
+lhs   <- c(rep(1, n_fr),   rep(-Inf, n_rn), rep(-Inf, n_y), grp_lhs)
+rhs   <- c(rep(Inf, n_fr), rep(0,    n_rn), rep(0,    n_y), grp_rhs)
+obj   <- c(params$lambda_fleet * buses_cand, rep(0, n_rn), obj_y)
+types <- c(rep("I", N_cand), rep("C", n_rn + n_y))
+
+cat(sprintf("Reach-ILP: %d routes, %d reach, %d trips (%d vars, %d constraints). Solving (HiGHS)...\n",
+            N_cand, n_rn, n_y, nv, nrow(A)))
+t0  <- Sys.time()
+res <- highs::highs_solve(L = obj, lower = rep(0, nv), upper = rep(1, nv),
+                          A = A, lhs = lhs, rhs = rhs, types = types, maximum = FALSE,
+                          control = highs::highs_control(mip_rel_gap = 0.02, time_limit = 600))
+cat(sprintf("HiGHS: %s in %.1f s\n", res$status_message,
+            as.numeric(Sys.time() - t0, units = "secs")))
+
+xv <- res$primal_solution[seq_len(N_cand)]
+yv <- res$primal_solution[ix_y]
+selected <- which(xv > 0.5)
+covered  <- logical(n_stops); for (ci in selected) covered[cov_sets[[ci]]] <- TRUE
+
+served <- yv > 0.5
+sf_ <- served & is_freq[y_s]
+freq_cov_n <- sum(covered[is_freq]); n_uncov_freq <- sum(is_freq) - freq_cov_n
+cat(sprintf("Selected %d routes | fleet ≈ %d buses @ %g-min | total rider-time %.0f min\n",
+            length(selected), sum(buses_cand[selected]), params$local_day_headway_min,
+            sum(p_y[served] * c_y[served])))
+cat(sprintf("Mean frequent trip time (ride to node + onward): %.1f min\n",
+            if (any(sf_)) sum(p_y[sf_] * c_y[sf_]) / sum(p_y[sf_]) else NA_real_))
+cat(sprintf("Frequent covered: %d / %d (%.1f%%)%s\n",
+            freq_cov_n, sum(is_freq), 100 * freq_cov_n / sum(is_freq),
+            if (n_uncov_freq > 0) sprintf("  [%d uncoverable]", n_uncov_freq) else ""))
+cat(sprintf("Local covered:    %d / %d (%.1f%%)\n",
+            sum(covered[!is_freq]), sum(!is_freq), 100 * mean(covered[!is_freq])))
+cat("Selected route types:\n"); print(table(type = vapply(candidates[selected], `[[`, character(1), "type")))
+cat("Nodes passed-through per selected route:\n")
+print(table(nodes = vapply(candidates[selected], function(c) length(c$nodes), integer(1))))
+```
+
+### On-route bus stops vs. walkshed coverage
+
+`covered` (used for *selection*) is walkshed: a stop is served if a route passes
+within `walk_dist_ft`. But the bus only physically **stops** where a stop lies on
+its path. Here we split each route's covered stops into **on-route** (within
+`on_route_buffer_ft` — real bus stops, get dwell, go in the GTFS/shapefile) and
+**walkshed-only** (farther out — the rider walks to the route; the bus does *not*
+stop, so no dwell). `route_onroute[[r]]` and `on_route_any` drive the export.
+
+```{r on-route-stops}
+# route_onroute is exactly cand_onroute (computed once for all candidates in the
+# route-cost chunk, so the fleet weight and the export use the identical stop set).
+route_onroute <- cand_onroute
+n_board <- integer(n_stops)                              # # selected routes boarding each stop
+for (r in selected) n_board[route_onroute[[r]]] <- n_board[route_onroute[[r]]] + 1L
+on_route_any <- n_board > 0L
+
+# Distance to nearest selected route, for the on-route/walkshed banding report.
+min_d_sel <- rep(Inf, n_stops)
+for (r in selected) {
+  cov <- candidates[[r]]$covered
+  if (!length(cov)) next
+  d <- dist_to_line(stops_planar_xy[cov, , drop = FALSE], line_planar(candidates[[r]]$coords))
+  min_d_sel[cov] <- pmin(min_d_sel[cov], d)
+}
+
+band <- cut(min_d_sel[is.finite(min_d_sel)],
+            breaks = c(-1, on_route_ft, params$walk_dist_ft, Inf),
+            labels = c(sprintf("on-route (<=%gft)", on_route_ft),
+                       sprintf("walkshed (%g-%gft)", on_route_ft, params$walk_dist_ft),
+                       "beyond"))
+cat("Covered stops by distance to nearest selected route:\n"); print(table(band))
+cat(sprintf("Frequent: %d board a bus on-route, %d walkshed-only (rider walks to route)\n",
+            sum(on_route_any & is_freq), sum(covered & is_freq & !on_route_any)))
+cat(sprintf("Local:    %d board a bus on-route, %d walkshed-only\n",
+            sum(on_route_any & !is_freq), sum(covered & !is_freq & !on_route_any)))
+n_thin <- sum(vapply(selected, function(r) length(route_onroute[[r]]) == 0L, logical(1)))
+if (n_thin > 0) cat(sprintf("NOTE: %d selected route(s) have 0 on-route stops (served only via walkshed).\n", n_thin))
+```
+
+### Save
+
+```{r local-save}
+local_routes <- lapply(seq_along(selected), function(s) {
+  ci <- candidates[[selected[s]]]
+  list(local_id = s, type = ci$type, nodes = ci$nodes,
+       vseq = ci$vseq, coords = ci$coords, covered = ci$covered)
+})
+
+saveRDS(
+  list(routes = local_routes,
+       stops  = stops_sf,
+       covered = covered,
+       is_freq = is_freq,
+       params  = params),
+  file.path(params$out_dir, "local_routes.rds")
+)
+
+# Uncovered frequent stops (the "couldn't serve" list for the writeup)
+unc_freq <- stops_sf[is_freq & !covered, ]
+cat(sprintf("Uncovered frequent stops: %d\n", nrow(unc_freq)))
+if (nrow(unc_freq) > 0) print(st_drop_geometry(unc_freq))
+```
+
+## Export: GTFS feed + shapefiles for ArcGIS
+
+The local feed is **self-contained** but uses the same node stop IDs (`N###`)
+as the express feed, so a rider's transfer at a node is recognized as the same
+physical stop across both feeds. Schedule conventions mirror the express feed
+(frequencies-based, Mon–Fri), but with local headways and a slower cruise speed.
+
+Each local route stops at the actual served stops (within `walk_dist_ft` of its
+path) plus the node(s) it runs through, ordered by position along the route
+polyline. Inter-stop travel time = along-path distance ÷ `bus_speed_mph`, with
+`dwell_sec` at each stop.
+
+```{r local-export-params}
+gtfs_dir   <- file.path(params$out_dir, "gtfs_node_local")
+gtfs_zip   <- file.path(params$gtfs_out_dir, "gtfs_node_local.zip")
+shp_routes <- file.path(params$out_dir, "local_routes.shp")
+shp_stops  <- file.path(params$out_dir, "local_stops.shp")
+dir.create(gtfs_dir, showWarnings = FALSE, recursive = TRUE)
+
+dwell_sec          <- as.integer(params$local_dwell_sec)
+bus_speed_fpm      <- params$bus_speed_mph * 5280 / 60     # feet per minute
+day_start          <- "05:00:00"; day_end   <- "22:00:00"
+night_start        <- "22:00:00"; night_end <- "29:00:00"  # 1 AM next service day
+day_headway_sec    <- as.integer(params$local_day_headway_min   * 60)
+night_headway_sec  <- as.integer(params$local_night_headway_min * 60)
+service_start_date <- "20260101"; service_end_date <- "20261231"
+
+# Arc-length position (planar feet) of each point projected onto a polyline.
+# line_xy: Nx2 planar; pts_xy: Mx2 planar. Clamps to segment ends so points
+# off the line still get a sensible along-line position for ordering.
+project_along <- function(pts_xy, line_xy) {
+  if (nrow(line_xy) < 2) return(rep(0, nrow(pts_xy)))
+  s0 <- line_xy[-nrow(line_xy), , drop = FALSE]
+  s1 <- line_xy[-1, , drop = FALSE]
+  sv  <- s1 - s0
+  sl2 <- rowSums(sv^2)
+  seglen <- sqrt(sl2)
+  cum <- c(0, cumsum(seglen))
+  vapply(seq_len(nrow(pts_xy)), function(p) {
+    px <- pts_xy[p, 1]; py <- pts_xy[p, 2]
+    t  <- ((px - s0[, 1]) * sv[, 1] + (py - s0[, 2]) * sv[, 2]) / pmax(sl2, 1e-9)
+    t  <- pmin(pmax(t, 0), 1)
+    dx <- s0[, 1] + t * sv[, 1] - px
+    dy <- s0[, 2] + t * sv[, 2] - py
+    k  <- which.min(dx^2 + dy^2)
+    cum[k] + t[k] * seglen[k]
+  }, numeric(1))
+}
+
+# Planar coords for stops and nodes (project once, reuse per route).
+stops_planar_xy <- sf::st_coordinates(stops_sf)            # X,Y in planar_crs
+node_planar_xy  <- sf::st_coordinates(
+  sf::st_transform(
+    sf::st_as_sf(node_info[, c("lon", "lat")], coords = c("lon", "lat"), crs = 4326),
+    params$planar_crs))
+
+# lon/lat route polyline -> Nx2 planar matrix
+line_planar <- function(coords_lonlat) {
+  m <- sf::st_linestring(coords_lonlat) |>
+    sf::st_sfc(crs = 4326) |>
+    sf::st_transform(params$planar_crs) |>
+    sf::st_coordinates()
+  m[, 1:2, drop = FALSE]
+}
+```
+
+### Build GTFS tables
+
+```{r local-build-gtfs}
+n_routes <- length(selected)
+cat(sprintf("Generating local GTFS for %d routes\n", n_routes))
+
+agency_df <- data.frame(
+  agency_id = "NodeNetLocal", agency_name = "Node-Based Network — Local",
+  agency_url = "https://example.org/node-net",
+  agency_timezone = "America/Los_Angeles", stringsAsFactors = FALSE)
+
+calendar_df <- data.frame(
+  service_id = "WEEKDAY",
+  monday = 1L, tuesday = 1L, wednesday = 1L, thursday = 1L, friday = 1L,
+  saturday = 0L, sunday = 0L,
+  start_date = service_start_date, end_date = service_end_date,
+  stringsAsFactors = FALSE)
+
+# --- stops.txt: on-route bus stops + every node. Nodes reuse the express feed's
+#     N### ids so a node is one physical stop across both feeds. (Walkshed-only
+#     covered stops are not bus stops, so they are not listed.) ---
+served_idx <- which(on_route_any)
+stops_df <- rbind(
+  data.frame(
+    stop_id   = stops_sf$stop_uid[served_idx],
+    stop_name = sprintf("%s %s", stops_sf$kind[served_idx], stops_sf$stop_uid[served_idx]),
+    stop_lat  = round(stops_xy[served_idx, "y"], 7),
+    stop_lon  = round(stops_xy[served_idx, "x"], 7),
+    stringsAsFactors = FALSE),
+  data.frame(
+    stop_id   = sprintf("N%03d", node_info$cell_id),
+    stop_name = sprintf("Node cell %d", node_info$cell_id),
+    stop_lat  = round(node_info$lat, 7),
+    stop_lon  = round(node_info$lon, 7),
+    stringsAsFactors = FALSE))
+stops_df <- stops_df[!duplicated(stops_df$stop_id), ]
+
+# routes.txt
+route_label <- function(ci) {
+  cc <- candidates[[ci]]; nl <- node_info$cell_id[cc$nodes]
+  switch(cc$type,
+    spoke   = sprintf("Local to Node %d",     nl[1]),
+    through = sprintf("Local through Node %d", nl[1]),
+    line    = sprintf("Local %s", paste(nl, collapse = " ↔ ")),
+    "Local")
+}
+routes_df <- data.frame(
+  route_id         = sprintf("LOC%03d", seq_len(n_routes)),
+  agency_id        = "NodeNetLocal",
+  route_short_name = sprintf("L%03d", seq_len(n_routes)),
+  route_long_name  = vapply(selected, route_label, character(1)),
+  route_type       = 3L, route_color = "8B4513", route_text_color = "FFFFFF",
+  stringsAsFactors = FALSE)
+
+trips_list <- list(); stop_times_list <- list()
+shapes_list <- list(); freq_list <- list()
+
+# ---- shared street-derived stop-time model (identical to the grid network) ----
+# Build sf routes/stops, run the grid pipeline (20/30 mph speed floors + accel/decel + signal /
+# gap-acceptance dwell + through-intersection delay), then read stop_times per route. Replaces the
+# old flat `bus_speed_mph` + `dwell_sec`. Local feeders have no bus lane, so the re-entry gate keeps
+# their non-signalized dwell at the base (≈8 s) — slower mid-block on residential, much less dwell.
+gst_p <- gst_default_params(list(
+  crs_work             = params$planar_crs,
+  stop_route_buffer_ft = 700,   # generous: keep every ILP-assigned stop/node on the route
+  signals_gpkg         = "data/public/sdot/traffic_signals.gpkg",
+  alllanes_geojson     = "outputs/streets/street_grid.geojson"))
+gst_routes <- do.call(rbind, lapply(seq_len(n_routes), function(r) {
+  co <- candidates[[selected[r]]]$coords
+  if (is.null(co) || nrow(co) < 2) return(NULL)
+  sf::st_sf(rid = sprintf("LOC%03d", r),
+            geometry = sf::st_sfc(sf::st_linestring(co[, 1:2]), crs = 4326))
+}))
+gst_stops   <- sf::st_as_sf(stops_df, coords = c("stop_lon", "stop_lat"), crs = 4326, remove = FALSE)
+gst_refs    <- gst_load_refs(gst_p)
+gst_prepped <- gst_prep(gst_routes, gst_refs, gst_p)
+gst_stops   <- gst_classify_stops(gst_stops, gst_prepped, gst_refs, gst_p)
+cat(sprintf("stop-time model: %d routes, %d stops, %.0f%% signalized\n",
+            nrow(gst_routes), nrow(gst_stops), 100 * mean(gst_stops$signalized)))
+
+for (r in seq_len(n_routes)) {
+  ci       <- candidates[[selected[r]]]
+  route_id <- sprintf("LOC%03d", r)
+  shape_id <- sprintf("SLOC%03d", r)
+  coords   <- ci$coords
+  if (is.null(coords) || nrow(coords) < 2L) next
+
+  # shape (forward geometry; both directions share it)
+  shapes_list[[length(shapes_list) + 1]] <- data.frame(
+    shape_id          = shape_id,
+    shape_pt_lat      = round(coords[, 2], 7),
+    shape_pt_lon      = round(coords[, 1], 7),
+    shape_pt_sequence = seq_len(nrow(coords)), stringsAsFactors = FALSE)
+
+  # this route's stops: ON-ROUTE stops + designated node(s), timed by the shared grid model
+  sidx  <- route_onroute[[selected[r]]]; if (is.null(sidx)) sidx <- integer(0)
+  rsids <- unique(c(stops_sf$stop_uid[sidx], sprintf("N%03d", node_info$cell_id[ci$nodes])))
+  cand  <- gst_stops[gst_stops$stop_id %in% rsids, ]
+  res   <- gst_route_stop_times(route_id, gst_routes[gst_routes$rid == route_id, ], cand, gst_prepped, gst_p)
+  if (is.null(res)) next
+  stop_times_list[[length(stop_times_list) + 1]] <- res$st0
+  stop_times_list[[length(stop_times_list) + 1]] <- res$st1
+
+  for (dir in 0:1) {
+    trip_id <- sprintf("%s_d%d", route_id, dir)
+    trips_list[[length(trips_list) + 1]] <- data.frame(
+      route_id = route_id, service_id = "WEEKDAY", trip_id = trip_id,
+      shape_id = shape_id, direction_id = as.integer(dir), stringsAsFactors = FALSE)
+    freq_list[[length(freq_list) + 1]] <- data.frame(
+      trip_id = trip_id, start_time = c(day_start, night_start),
+      end_time = c(day_end, night_end),
+      headway_secs = c(day_headway_sec, night_headway_sec),
+      exact_times = 0L, stringsAsFactors = FALSE)
+  }
+}
+
+trips_df      <- bind_rows(trips_list)
+stop_times_df <- bind_rows(stop_times_list)
+shapes_df     <- bind_rows(shapes_list)
+freq_df       <- bind_rows(freq_list)
+
+# Referential integrity: keep only stops that a trip actually visits.
+stops_df <- stops_df[stops_df$stop_id %in% unique(stop_times_df$stop_id), ]
+
+data.frame(
+  table = c("agency", "routes", "stops", "trips", "stop_times",
+            "shapes", "calendar", "frequencies"),
+  rows  = c(nrow(agency_df), nrow(routes_df), nrow(stops_df),
+            nrow(trips_df), nrow(stop_times_df), nrow(shapes_df),
+            nrow(calendar_df), nrow(freq_df)))
+```
+
+### Write GTFS feed + zip
+
+```{r local-write-gtfs}
+fwrite(agency_df,     file.path(gtfs_dir, "agency.txt"))
+fwrite(routes_df,     file.path(gtfs_dir, "routes.txt"))
+fwrite(stops_df,      file.path(gtfs_dir, "stops.txt"))
+fwrite(trips_df,      file.path(gtfs_dir, "trips.txt"))
+fwrite(stop_times_df, file.path(gtfs_dir, "stop_times.txt"))
+fwrite(calendar_df,   file.path(gtfs_dir, "calendar.txt"))
+fwrite(shapes_df,     file.path(gtfs_dir, "shapes.txt"))
+fwrite(freq_df,       file.path(gtfs_dir, "frequencies.txt"))
+
+if (file.exists(gtfs_zip)) unlink(gtfs_zip)
+# Pure-R zip (the external `zip` program isn't on PATH on Windows, so
+# utils::zip() silently produced no archive). setwd into the feed dir +
+# relative file names makes the .txt files sit at the archive root (GTFS
+# requires a flat archive); zip::zip's `root=` arg did NOT flatten here.
+gtfs_zip_abs <- file.path(normalizePath(dirname(gtfs_zip)), basename(gtfs_zip))
+old_wd <- setwd(gtfs_dir)
+tryCatch(zip::zip(zipfile = gtfs_zip_abs, files = list.files(".")),
+         finally = setwd(old_wd))
+cat(sprintf("GTFS feed: %s\n", normalizePath(gtfs_zip)))
+```
+
+### Write shapefiles (routes + stops) for ArcGIS
+
+```{r local-write-shapefiles}
+route_rows <- lapply(seq_len(n_routes), function(r) {
+  ci     <- candidates[[selected[r]]]
+  coords <- ci$coords
+  if (is.null(coords) || nrow(coords) < 2L) return(NULL)
+  lxy    <- line_planar(coords)
+  len_mi <- sum(sqrt(rowSums(diff(lxy)^2))) / 5280
+  cov    <- route_onroute[[selected[r]]]; if (is.null(cov)) cov <- integer(0)  # physical stops
+  list(local_id = r, type = ci$type,
+       nodes  = paste(node_info$cell_id[ci$nodes], collapse = "-"),
+       n_stop = length(cov), n_freq = sum(is_freq[cov]),
+       len_mi = round(len_mi, 2), geom = sf::st_linestring(coords))
+})
+route_rows <- Filter(Negate(is.null), route_rows)
+
+routes_shp <- sf::st_sf(
+  local_id = vapply(route_rows, `[[`, integer(1),   "local_id"),
+  type     = vapply(route_rows, `[[`, character(1), "type"),
+  nodes    = vapply(route_rows, `[[`, character(1), "nodes"),
+  n_stop   = vapply(route_rows, `[[`, integer(1),   "n_stop"),
+  n_freq   = vapply(route_rows, `[[`, integer(1),   "n_freq"),
+  len_mi   = vapply(route_rows, `[[`, numeric(1),   "len_mi"),
+  geometry = sf::st_sfc(lapply(route_rows, `[[`, "geom"), crs = 4326))
+
+# Stops: only the ACTUAL bus stops (on-route, where the bus dwells) + nodes.
+# Walkshed-only covered stops are excluded — the bus does not stop there.
+board_idx <- which(on_route_any)
+served_shp <- sf::st_transform(stops_sf[board_idx, ], 4326)
+served_shp$n_routes <- n_board[board_idx]            # # selected routes boarding this stop
+served_shp <- served_shp[, c("stop_uid", "kind", "n_routes")]
+node_shp <- sf::st_as_sf(
+  data.frame(stop_uid = sprintf("N%03d", node_info$cell_id), kind = "node",
+             n_routes = NA_integer_, lon = node_info$lon, lat = node_info$lat,
+             stringsAsFactors = FALSE),
+  coords = c("lon", "lat"), crs = 4326)
+sf::st_geometry(served_shp) <- "geometry"
+sf::st_geometry(node_shp)   <- "geometry"
+stops_shp <- rbind(served_shp, node_shp[, c("stop_uid", "kind", "n_routes")])
+cat(sprintf("local_stops.shp: %d on-route bus stops + %d nodes\n",
+            length(board_idx), nrow(node_shp)))
+
+# Clean old shapefile siblings before writing
+for (base in c(tools::file_path_sans_ext(shp_routes),
+               tools::file_path_sans_ext(shp_stops))) {
+  for (ext in c(".shp", ".shx", ".dbf", ".prj", ".cpg")) {
+    f <- paste0(base, ext); if (file.exists(f)) unlink(f)
+  }
+}
+st_write(routes_shp, shp_routes, append = FALSE, quiet = TRUE)
+st_write(stops_shp,  shp_stops,  append = FALSE, quiet = TRUE)
+cat(sprintf("Shapefiles:\n  %s\n  %s\n",
+            normalizePath(shp_routes), normalizePath(shp_stops)))
+```
+## Fleet-size diagnostic

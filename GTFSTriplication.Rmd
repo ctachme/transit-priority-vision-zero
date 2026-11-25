@@ -1,0 +1,1563 @@
+---
+title: "GTFSTriplication"
+author: "Stephen Siciliano"
+date: "2025-12-22"
+output: html_document
+---
+
+```{r}
+
+# ============================================================
+# GTFS frequency scaling + express overlay generator
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(stringr)
+  library(lubridate)
+  library(digest)
+  library(gtfsio)   # import_gtfs(), export_gtfs()
+  library(progress)
+})
+
+# -----------------------------
+# Time helpers (support >24:00:00)
+# -----------------------------
+time_to_sec <- function(x) {
+  if (is.null(x)) return(NULL)
+  x <- as.character(x)
+  out <- rep(NA_integer_, length(x))
+  ok <- !is.na(x) & nzchar(x)
+  if (!any(ok)) return(out)
+
+  parts <- str_split_fixed(x[ok], ":", 3)
+  h <- suppressWarnings(as.integer(parts[, 1]))
+  m <- suppressWarnings(as.integer(parts[, 2]))
+  s <- suppressWarnings(as.integer(parts[, 3]))
+  out[ok] <- h * 3600L + m * 60L + s
+  out
+}
+
+sec_to_time <- function(s) {
+  s <- as.integer(s)
+  h <- s %/% 3600L
+  m <- (s %% 3600L) %/% 60L
+  sec <- s %% 60L
+  sprintf("%d:%02d:%02d", h, m, sec)
+}
+
+# -----------------------------
+# Collapse feed to two service patterns:
+# one representative weekday + one representative weekend/holiday
+# -----------------------------
+
+pick_typical_service_date <- function(gtfs, weekday = "wednesday") {
+  weekday <- tolower(weekday)
+
+  if (!("calendar" %in% names(gtfs)) || is.null(gtfs$calendar) || nrow(gtfs$calendar) == 0) {
+    stop("GTFS has no calendar.txt.")
+  }
+
+  cal <- gtfs$calendar %>%
+    mutate(
+      start_date = ymd(start_date),
+      end_date   = ymd(end_date)
+    )
+
+  d0 <- min(cal$start_date, na.rm = TRUE)
+  d1 <- max(cal$end_date, na.rm = TRUE)
+
+  candidates <- seq.Date(d0, d1, by = "day")
+  target_wday <- match(
+    weekday,
+    tolower(c("sunday","monday","tuesday","wednesday","thursday","friday","saturday"))
+  ) - 1L
+
+  candidates <- candidates[(wday(candidates) - 1L) == target_wday]
+
+  if (length(candidates) == 0) stop("No matching weekday dates found in calendar range.")
+
+  # Prefer a date with no exceptions, if possible
+  if ("calendar_dates" %in% names(gtfs) && !is.null(gtfs$calendar_dates) && nrow(gtfs$calendar_dates) > 0) {
+    cd <- gtfs$calendar_dates %>% mutate(date = ymd(date))
+
+    ex_count <- vapply(candidates, function(d) {
+      sum(cd$date == d, na.rm = TRUE)
+    }, integer(1))
+
+    if (any(ex_count == 0L)) return(candidates[which(ex_count == 0L)[1]])
+    return(candidates[which.min(ex_count)])
+  }
+
+  candidates[1]
+}
+
+duplicate_trip_block <- function(trips_tbl, stop_times_tbl, trip_ids, new_service_id, trip_suffix) {
+  trips_out <- trips_tbl %>%
+    filter(trip_id %in% trip_ids) %>%
+    mutate(
+      trip_id = paste0(as.character(trip_id), trip_suffix),
+      service_id = new_service_id
+    )
+
+  stop_times_out <- stop_times_tbl %>%
+    filter(trip_id %in% trip_ids) %>%
+    mutate(
+      trip_id = paste0(as.character(trip_id), trip_suffix)
+    )
+
+  list(
+    trips = trips_out,
+    stop_times = stop_times_out
+  )
+}
+
+collapse_to_two_service_patterns <- function(gtfs,
+                                             weekday_date,
+                                             weekend_date,
+                                             holiday_dates = as.Date(character()),
+                                             year = 2026L) {
+
+  weekday_service_id <- paste0("WEEKDAY_", year)
+  weekend_service_id <- paste0("WEEKEND_HOLIDAY_", year)
+
+  weekday_source_services <- services_active_on_date(gtfs, weekday_date)
+  weekend_source_services <- services_active_on_date(gtfs, weekend_date)
+
+  weekday_trip_ids <- gtfs$trips %>%
+    filter(service_id %in% weekday_source_services) %>%
+    pull(trip_id) %>%
+    unique()
+
+  weekend_trip_ids <- gtfs$trips %>%
+    filter(service_id %in% weekend_source_services) %>%
+    pull(trip_id) %>%
+    unique()
+
+  weekday_block <- duplicate_trip_block(
+    trips_tbl = gtfs$trips,
+    stop_times_tbl = gtfs$stop_times,
+    trip_ids = weekday_trip_ids,
+    new_service_id = weekday_service_id,
+    trip_suffix = "_WKD"
+  )
+
+  weekend_block <- duplicate_trip_block(
+    trips_tbl = gtfs$trips,
+    stop_times_tbl = gtfs$stop_times,
+    trip_ids = weekend_trip_ids,
+    new_service_id = weekend_service_id,
+    trip_suffix = "_WKE"
+  )
+
+  gtfs$trips <- bind_rows(
+    weekday_block$trips,
+    weekend_block$trips
+  )
+
+  gtfs$stop_times <- bind_rows(
+    weekday_block$stop_times,
+    weekend_block$stop_times
+  )
+
+  start_date_chr <- sprintf("%d0101", year)
+  end_date_chr   <- sprintf("%d1231", year)
+
+  gtfs$calendar <- tibble::tibble(
+    service_id = c(weekday_service_id, weekend_service_id),
+    monday    = c(1L, 0L),
+    tuesday   = c(1L, 0L),
+    wednesday = c(1L, 0L),
+    thursday  = c(1L, 0L),
+    friday    = c(1L, 0L),
+    saturday  = c(0L, 1L),
+    sunday    = c(0L, 1L),
+    start_date = c(start_date_chr, start_date_chr),
+    end_date   = c(end_date_chr, end_date_chr)
+  )
+
+  holiday_dates <- sort(unique(as.Date(holiday_dates)))
+  holiday_dates <- holiday_dates[!is.na(holiday_dates)]
+
+  if (length(holiday_dates) > 0) {
+    gtfs$calendar_dates <- tibble::tibble(
+      service_id = c(
+        rep(weekday_service_id, length(holiday_dates)),
+        rep(weekend_service_id, length(holiday_dates))
+      ),
+      date = c(
+        format(holiday_dates, "%Y%m%d"),
+        format(holiday_dates, "%Y%m%d")
+      ),
+      exception_type = c(
+        rep(2L, length(holiday_dates)),  # remove weekday service
+        rep(1L, length(holiday_dates))   # add weekend/holiday service
+      )
+    )
+  } else {
+    gtfs$calendar_dates <- tibble::tibble(
+      service_id = character(),
+      date = character(),
+      exception_type = integer()
+    )
+  }
+
+  gtfs
+}
+# -----------------------------
+# Compute services active on a given date (calendar + calendar_dates exceptions)
+# -----------------------------
+services_active_on_date <- function(gtfs, date) {
+  if (!("calendar" %in% names(gtfs)) || is.null(gtfs$calendar)) stop("Missing calendar.txt.")
+  cal <- gtfs$calendar %>%
+    mutate(
+      start_date = ymd(start_date),
+      end_date   = ymd(end_date)
+    )
+
+  wday_name <- tolower(weekdays(date))  # e.g., "wednesday"
+  wday_col <- wday_name
+  if (!(wday_col %in% names(cal))) {
+    # calendar uses monday..sunday
+    stop("Unexpected weekday column naming in calendar.txt.")
+  }
+
+  active <- cal %>%
+    filter(start_date <= date, end_date >= date, .data[[wday_col]] == 1) %>%
+    pull(service_id) %>%
+    unique()
+
+  # Apply calendar_dates exceptions if present
+  if ("calendar_dates" %in% names(gtfs) && !is.null(gtfs$calendar_dates) && nrow(gtfs$calendar_dates) > 0) {
+    cd <- gtfs$calendar_dates %>%
+      mutate(date = ymd(date)) %>%
+      filter(date == !!date)
+
+    added   <- cd %>% filter(exception_type == 1) %>% pull(service_id) %>% unique()
+    removed <- cd %>% filter(exception_type == 2) %>% pull(service_id) %>% unique()
+
+    active <- union(active, added)
+    active <- setdiff(active, removed)
+  }
+
+  active
+}
+
+# -----------------------------
+# Expand frequencies.txt into explicit trips (and drop frequencies)
+# -----------------------------
+expand_frequencies_to_trips <- function(gtfs) {
+  if (!("frequencies" %in% names(gtfs)) || is.null(gtfs$frequencies) || nrow(gtfs$frequencies) == 0) {
+    return(gtfs)
+  }
+
+  freq <- gtfs$frequencies %>%
+    mutate(
+      start_sec = time_to_sec(start_time),
+      end_sec   = time_to_sec(end_time),
+      headway_secs = as.integer(headway_secs)
+    ) %>%
+    filter(!is.na(start_sec), !is.na(end_sec), !is.na(headway_secs), headway_secs > 0)
+
+  if (nrow(freq) == 0) {
+    gtfs$frequencies <- gtfs$frequencies[0, , drop = FALSE]
+    return(gtfs)
+  }
+
+  st <- gtfs$stop_times %>%
+    mutate(
+      arr_sec = time_to_sec(arrival_time),
+      dep_sec = time_to_sec(departure_time)
+    )
+
+  trips <- gtfs$trips
+
+  trip_first_dep <- st %>%
+    group_by(trip_id) %>%
+    summarize(first_dep_sec = min(dep_sec, na.rm = TRUE), .groups = "drop")
+
+  # Build explicit runs
+  new_trips_list <- list()
+  new_stop_times_list <- list()
+  kill_trip_ids <- unique(freq$trip_id)
+
+  for (i in seq_len(nrow(freq))) {
+    f <- freq[i, ]
+
+    tpl_trip_id <- f$trip_id
+    tpl_trip <- trips %>% filter(trip_id == tpl_trip_id)
+    tpl_st   <- st %>% filter(trip_id == tpl_trip_id) %>% arrange(stop_sequence)
+
+    if (nrow(tpl_trip) == 0 || nrow(tpl_st) == 0) next
+
+    tpl_first <- trip_first_dep %>% filter(trip_id == tpl_trip_id) %>% pull(first_dep_sec)
+    if (length(tpl_first) == 0 || is.na(tpl_first)) next
+
+    # Rebase template so its first departure aligns to frequencies start_time
+    rebase_offset <- f$start_sec - tpl_first
+
+    run_starts <- seq(from = f$start_sec, to = f$end_sec - f$headway_secs, by = f$headway_secs)
+    if (length(run_starts) == 0) next
+
+    for (k in seq_along(run_starts)) {
+      run_start <- run_starts[k]
+      shift <- rebase_offset + (run_start - f$start_sec)
+
+      new_trip_id <- paste0(tpl_trip_id, "_FREQ_", sprintf("%04d", i), "_", sprintf("%04d", k))
+
+      nt <- tpl_trip %>%
+        mutate(trip_id = new_trip_id)
+
+      nst <- tpl_st %>%
+        mutate(
+          trip_id = new_trip_id,
+          arrival_time   = sec_to_time(arr_sec + shift),
+          departure_time = sec_to_time(dep_sec + shift)
+        ) %>%
+        select(-arr_sec, -dep_sec)
+
+      new_trips_list[[length(new_trips_list) + 1]] <- nt
+      new_stop_times_list[[length(new_stop_times_list) + 1]] <- nst
+    }
+  }
+
+  # Keep non-frequency trips + add expanded trips; drop frequencies table
+  trips2 <- trips %>% filter(!trip_id %in% kill_trip_ids) %>% bind_rows(bind_rows(new_trips_list))
+  st2    <- gtfs$stop_times %>% filter(!trip_id %in% kill_trip_ids) %>% bind_rows(bind_rows(new_stop_times_list))
+
+  gtfs$trips <- trips2
+  gtfs$stop_times <- st2
+  gtfs$frequencies <- gtfs$frequencies[0, , drop = FALSE]
+  gtfs
+}
+
+# -----------------------------
+# Add pattern_id per trip based on ordered stop_ids
+# -----------------------------
+add_pattern_id <- function(gtfs) {
+  st <- gtfs$stop_times %>%
+    arrange(trip_id, stop_sequence) %>%
+    group_by(trip_id) %>%
+    summarize(
+      pattern_key = paste(stop_id, collapse = "|"),
+      .groups = "drop"
+    ) %>%
+    mutate(pattern_id = vapply(pattern_key, digest, character(1), algo = "xxhash64"))
+
+  gtfs$trips <- gtfs$trips %>% left_join(st %>% select(trip_id, pattern_id), by = "trip_id")
+  gtfs
+}
+
+# -----------------------------
+# Compute trip start time (first departure) per trip
+# -----------------------------
+compute_trip_starts <- function(gtfs) {
+  st <- gtfs$stop_times %>%
+    mutate(dep_sec = time_to_sec(departure_time)) %>%
+    group_by(trip_id) %>%
+    summarize(start_sec = min(dep_sec, na.rm = TRUE), .groups = "drop")
+
+  gtfs$trips %>%
+    left_join(st, by = "trip_id")
+}
+
+# -----------------------------
+# Headway summary (midday + all-day) by route/direction/pattern
+# -----------------------------
+
+# Safe median headway (minutes) given a vector of start times (seconds)
+safe_median_headway_min <- function(starts_sec) {
+  starts_sec <- sort(starts_sec[is.finite(starts_sec)])
+  if (length(starts_sec) < 3) return(NA_real_)
+  median(diff(starts_sec)) / 60
+}
+
+headway_summary <- function(trips_w_starts, routes_tbl,
+                            midday = c("10:00:00", "14:00:00"),
+                            allday = c("06:00:00", "19:00:00")) {
+
+  md0 <- time_to_sec(midday[1]); md1 <- time_to_sec(midday[2])
+  ad0 <- time_to_sec(allday[1]); ad1 <- time_to_sec(allday[2])
+
+  trips_w_starts %>%
+    filter(!is.na(route_id), !is.na(direction_id), !is.na(pattern_id), !is.na(start_sec)) %>%
+    group_by(route_id, direction_id, pattern_id) %>%
+    summarize(
+      trips_midday = sum(start_sec >= md0 & start_sec <= md1, na.rm = TRUE),
+      trips_allday = sum(start_sec >= ad0 & start_sec <= ad1, na.rm = TRUE),
+      median_headway_midday_min = safe_median_headway_min(start_sec[start_sec >= md0 & start_sec <= md1]),
+      median_headway_allday_min = safe_median_headway_min(start_sec[start_sec >= ad0 & start_sec <= ad1]),
+      .groups = "drop"
+    ) %>%
+    left_join(routes_tbl %>% select(route_id, route_short_name, route_long_name), by = "route_id") %>%
+    mutate(
+      express_needed = !is.na(median_headway_allday_min) & median_headway_allday_min <= 10,
+      multiplier_local = if_else(express_needed, 2L, 3L)
+    ) %>%
+    arrange(route_short_name, route_id, direction_id, pattern_id)
+}
+
+# -----------------------------
+# Generate inserted trips between existing trips within a group
+# (route_id + direction_id + pattern_id)
+# -----------------------------
+densify_group <- function(gtfs, group_trips, multiplier, id_prefix = "GEN") {
+  # group_trips: trips with start_sec present; already filtered to a single group
+  if (multiplier < 2) return(list(trips = gtfs$trips[0, , drop = FALSE],
+                                 stop_times = gtfs$stop_times[0, , drop = FALSE]))
+
+  group_trips <- group_trips %>%
+    arrange(start_sec)
+
+  if (nrow(group_trips) < 2) {
+    return(list(trips = gtfs$trips[0, , drop = FALSE],
+                stop_times = gtfs$stop_times[0, , drop = FALSE]))
+  }
+
+  st <- gtfs$stop_times %>%
+    mutate(arr_sec = time_to_sec(arrival_time),
+           dep_sec = time_to_sec(departure_time))
+
+  new_trips <- list()
+  new_sts   <- list()
+  ctr <- 0L
+
+  for (i in seq_len(nrow(group_trips) - 1)) {
+    t0 <- group_trips$start_sec[i]
+    t1 <- group_trips$start_sec[i + 1]
+    if (is.na(t0) || is.na(t1) || t1 <= t0) next
+
+    dt <- t1 - t0
+    tpl_trip_id <- group_trips$trip_id[i]
+    tpl_trip <- gtfs$trips %>% filter(trip_id == tpl_trip_id)
+    tpl_st   <- st %>% filter(trip_id == tpl_trip_id) %>% arrange(stop_sequence)
+
+    if (nrow(tpl_trip) == 0 || nrow(tpl_st) == 0) next
+
+    for (k in 1:(multiplier - 1)) {
+      ctr <- ctr + 1L
+      new_start <- t0 + round(dt * (k / multiplier))
+      shift <- new_start - t0
+
+      new_trip_id <- paste0(tpl_trip_id, "_", id_prefix, "_", sprintf("%06d", ctr), "_S", shift)
+
+      nt <- tpl_trip %>%
+        mutate(trip_id = new_trip_id)
+
+      nst <- tpl_st %>%
+        mutate(
+          trip_id = new_trip_id,
+          arrival_time   = sec_to_time(arr_sec + shift),
+          departure_time = sec_to_time(dep_sec + shift)
+        ) %>%
+        select(-arr_sec, -dep_sec)
+
+      new_trips[[length(new_trips) + 1]] <- nt
+      new_sts[[length(new_sts) + 1]]     <- nst
+    }
+  }
+
+  list(trips = bind_rows(new_trips),
+       stop_times = bind_rows(new_sts))
+}
+
+# -----------------------------
+# Create express overlay for a route_id:
+# - new route row
+# - express trips cloned from baseline trips (no densification)
+# - stop at timepoints only (+ first/last)
+# - cumulative -60 sec per skipped stop
+# -----------------------------
+make_express_overlay <- function(gtfs,
+                                 route_id,
+                                 express_suffix = "_EXP",
+                                 save_per_skipped_stop_sec = 30L,
+                                 min_segment_run_sec = 15L,
+                                 min_dwell_sec = 0L) {
+  if (!("timepoint" %in% names(gtfs$stop_times))) {
+    stop("Express overlay requested, but stop_times.txt has no 'timepoint' column.")
+  }
+
+  routes <- gtfs$routes
+  trips  <- gtfs$trips
+  st     <- gtfs$stop_times %>%
+    mutate(
+      arr_sec = time_to_sec(arrival_time),
+      dep_sec = time_to_sec(departure_time)
+    )
+
+  base_route <- routes %>% filter(route_id == !!route_id)
+  if (nrow(base_route) == 0) stop("route_id not found in routes.txt: ", route_id)
+
+  existing_route_ids <- routes$route_id
+  exp_route_id <- paste0(route_id, express_suffix)
+  if (exp_route_id %in% existing_route_ids) {
+    exp_route_id <- paste0(route_id, "_X")
+    if (exp_route_id %in% existing_route_ids) {
+      exp_route_id <- paste0(route_id, "_EXP_", substr(digest(route_id), 1, 6))
+    }
+  }
+
+  exp_route <- base_route %>%
+    mutate(
+      route_id = exp_route_id,
+      route_short_name = if_else(
+        !is.na(route_short_name) & nzchar(route_short_name),
+        paste0(route_short_name, "X"),
+        paste0(route_id, "X")
+      ),
+      route_long_name = if_else(
+        !is.na(route_long_name) & nzchar(route_long_name),
+        paste0(route_long_name, " Express"),
+        "Express"
+      )
+    )
+
+  base_trips <- trips %>% filter(route_id == !!route_id)
+
+  new_trips <- list()
+  new_sts   <- list()
+
+  for (i in seq_len(nrow(base_trips))) {
+    tr <- base_trips[i, ]
+    tpl_trip_id <- tr$trip_id
+
+    tpl_st <- st %>%
+      filter(trip_id == tpl_trip_id) %>%
+      arrange(stop_sequence)
+
+    if (nrow(tpl_st) == 0) next
+
+    # Keep timepoints + endpoints
+    keep_idx <- which(tpl_st$timepoint == 1)
+    keep_idx <- sort(unique(c(1, keep_idx, nrow(tpl_st))))
+
+    kept <- tpl_st[keep_idx, , drop = FALSE]
+    if (nrow(kept) < 2) next
+
+    # Build new times iteratively so every kept-to-kept segment stays valid
+    new_arr <- rep(NA_integer_, nrow(kept))
+    new_dep <- rep(NA_integer_, nrow(kept))
+
+    # First stop: keep original times
+    first_arr <- kept$arr_sec[1]
+    first_dep <- kept$dep_sec[1]
+
+    if (is.na(first_arr) && !is.na(first_dep)) first_arr <- first_dep
+    if (is.na(first_dep) && !is.na(first_arr)) first_dep <- first_arr
+    if (is.na(first_arr) && is.na(first_dep)) next
+
+    if (first_dep < first_arr) first_dep <- first_arr
+
+    new_arr[1] <- first_arr
+    new_dep[1] <- first_dep
+
+    # Subsequent kept stops
+    for (j in 2:nrow(kept)) {
+      prev_idx <- keep_idx[j - 1]
+      curr_idx <- keep_idx[j]
+
+      prev_orig_dep <- kept$dep_sec[j - 1]
+      curr_orig_arr <- kept$arr_sec[j]
+      curr_orig_dep <- kept$dep_sec[j]
+
+      if (is.na(prev_orig_dep) || is.na(curr_orig_arr)) next
+
+      # Original kept-to-kept running time
+      orig_run_sec <- curr_orig_arr - prev_orig_dep
+
+      # Guard against odd source data
+      if (is.na(orig_run_sec) || orig_run_sec <= 0) {
+        orig_run_sec <- min_segment_run_sec
+      }
+
+      skipped_between <- curr_idx - prev_idx - 1L
+      desired_save_sec <- max(0L, skipped_between) * as.integer(save_per_skipped_stop_sec)
+
+      # Cap savings so resulting run time remains strictly positive and realistic
+      max_save_sec <- max(0L, orig_run_sec - as.integer(min_segment_run_sec))
+      actual_save_sec <- min(desired_save_sec, max_save_sec)
+
+      new_run_sec <- max(as.integer(min_segment_run_sec), orig_run_sec - actual_save_sec)
+
+      # Preserve original dwell at the kept stop, but never let it go negative
+      if (is.na(curr_orig_dep)) curr_orig_dep <- curr_orig_arr
+      orig_dwell_sec <- curr_orig_dep - curr_orig_arr
+      if (is.na(orig_dwell_sec) || orig_dwell_sec < min_dwell_sec) {
+        orig_dwell_sec <- as.integer(min_dwell_sec)
+      }
+
+      new_arr[j] <- new_dep[j - 1] + new_run_sec
+      new_dep[j] <- new_arr[j] + orig_dwell_sec
+
+      # Final guard: departure cannot be before arrival
+      if (new_dep[j] < new_arr[j]) {
+        new_dep[j] <- new_arr[j]
+      }
+    }
+
+    # If any kept stop still failed to get a time, skip this express trip
+    if (any(is.na(new_arr)) || any(is.na(new_dep))) next
+
+    kept <- kept %>%
+      mutate(
+        arr_sec = new_arr,
+        dep_sec = new_dep,
+        arrival_time   = sec_to_time(arr_sec),
+        departure_time = sec_to_time(dep_sec),
+        stop_sequence  = seq_along(keep_idx),
+        timepoint = 1
+      )
+
+    new_trip_id <- paste0(tpl_trip_id, "_EXP")
+
+    nt <- tr %>%
+      mutate(
+        route_id = exp_route_id,
+        trip_id = new_trip_id,
+        trip_headsign = if ("trip_headsign" %in% names(tr)) {
+          if_else(
+            !is.na(trip_headsign) & nzchar(trip_headsign),
+            paste0(trip_headsign, " Express"),
+            "Express"
+          )
+        } else trip_headsign
+      )
+
+    nst <- kept %>%
+      mutate(trip_id = new_trip_id) %>%
+      select(-arr_sec, -dep_sec)
+
+    new_trips[[length(new_trips) + 1]] <- nt
+    new_sts[[length(new_sts) + 1]]     <- nst
+  }
+
+  list(
+    routes_add = exp_route,
+    trips_add = bind_rows(new_trips),
+    stop_times_add = bind_rows(new_sts)
+  )
+}
+
+# -----------------------------
+# Apply transit signal priority + transit lanes by replacing every trip's
+# segment timings with the fastest trip's timings within its
+# (route_id, direction_id, pattern_id) group. The trip's first-stop
+# departure time is preserved as the anchor.
+# -----------------------------
+apply_tsp <- function(gtfs) {
+  # Recompute pattern_id so express overlays (which inherited the base trip's
+  # pattern_id but have a different actual stop sequence) get grouped correctly
+  if ("pattern_id" %in% names(gtfs$trips)) {
+    gtfs$trips <- gtfs$trips %>% select(-pattern_id)
+  }
+  gtfs <- add_pattern_id(gtfs)
+
+  st <- gtfs$stop_times %>%
+    mutate(
+      arr_sec = time_to_sec(arrival_time),
+      dep_sec = time_to_sec(departure_time)
+    ) %>%
+    arrange(trip_id, stop_sequence) %>%
+    group_by(trip_id) %>%
+    mutate(stop_idx = row_number()) %>%
+    ungroup()
+
+  trip_first_dep <- st %>%
+    group_by(trip_id) %>%
+    summarize(
+      first_dep = suppressWarnings(min(dep_sec, na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    filter(is.finite(first_dep))
+
+  trip_durations <- st %>%
+    group_by(trip_id) %>%
+    summarize(
+      duration = suppressWarnings(max(arr_sec, na.rm = TRUE)) -
+                 suppressWarnings(min(dep_sec, na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    filter(is.finite(duration))
+
+  trip_info <- trip_durations %>%
+    inner_join(trip_first_dep, by = "trip_id") %>%
+    inner_join(
+      gtfs$trips %>% select(trip_id, route_id, direction_id, pattern_id),
+      by = "trip_id"
+    )
+
+  fastest_trips <- trip_info %>%
+    filter(!is.na(pattern_id), duration > 0) %>%
+    group_by(route_id, direction_id, pattern_id) %>%
+    slice_min(duration, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(
+      route_id, direction_id, pattern_id,
+      fastest_trip_id = trip_id,
+      fastest_first_dep = first_dep
+    )
+
+  fastest_st_relative <- st %>%
+    inner_join(
+      fastest_trips %>% select(fastest_trip_id, fastest_first_dep),
+      by = c("trip_id" = "fastest_trip_id")
+    ) %>%
+    mutate(
+      rel_arr = arr_sec - fastest_first_dep,
+      rel_dep = dep_sec - fastest_first_dep
+    ) %>%
+    rename(fastest_trip_id = trip_id) %>%
+    select(fastest_trip_id, stop_idx, rel_arr, rel_dep)
+
+  trip_to_fastest <- trip_info %>%
+    left_join(
+      fastest_trips %>% select(route_id, direction_id, pattern_id, fastest_trip_id),
+      by = c("route_id", "direction_id", "pattern_id")
+    ) %>%
+    select(trip_id, first_dep, fastest_trip_id)
+
+  new_st <- st %>%
+    left_join(trip_to_fastest, by = "trip_id") %>%
+    left_join(fastest_st_relative, by = c("fastest_trip_id", "stop_idx")) %>%
+    mutate(
+      arrival_time = if_else(
+        !is.na(rel_arr) & !is.na(first_dep),
+        sec_to_time(first_dep + rel_arr),
+        arrival_time
+      ),
+      departure_time = if_else(
+        !is.na(rel_dep) & !is.na(first_dep),
+        sec_to_time(first_dep + rel_dep),
+        departure_time
+      )
+    ) %>%
+    select(-arr_sec, -dep_sec, -stop_idx, -first_dep, -fastest_trip_id, -rel_arr, -rel_dep)
+
+  gtfs$stop_times <- new_st
+  gtfs
+}
+
+# -----------------------------
+# Total weekly service hours = sum over trips of (last_arr - first_dep)
+# weighted by the trip's service_id's days-per-week from calendar.txt.
+# Lets us compare networks that share the same calendar structure.
+# -----------------------------
+compute_service_hours <- function(gtfs, trip_id_filter = NULL) {
+  trips <- gtfs$trips
+  if (!is.null(trip_id_filter)) {
+    trips <- trips %>% filter(trip_id %in% trip_id_filter)
+  }
+
+  st <- gtfs$stop_times %>%
+    filter(trip_id %in% trips$trip_id) %>%
+    mutate(
+      arr_sec = time_to_sec(arrival_time),
+      dep_sec = time_to_sec(departure_time)
+    )
+
+  trip_hours <- st %>%
+    group_by(trip_id) %>%
+    summarize(
+      duration_h = pmax(
+        0,
+        suppressWarnings(max(arr_sec, na.rm = TRUE)) -
+        suppressWarnings(min(dep_sec, na.rm = TRUE))
+      ) / 3600,
+      .groups = "drop"
+    ) %>%
+    filter(is.finite(duration_h))
+
+  cal <- gtfs$calendar %>%
+    mutate(
+      days_per_week = as.integer(monday) + as.integer(tuesday) +
+                      as.integer(wednesday) + as.integer(thursday) +
+                      as.integer(friday) + as.integer(saturday) +
+                      as.integer(sunday)
+    ) %>%
+    select(service_id, days_per_week)
+
+  trips %>%
+    select(trip_id, service_id) %>%
+    inner_join(trip_hours, by = "trip_id") %>%
+    inner_join(cal, by = "service_id") %>%
+    mutate(weekly_h = duration_h * days_per_week) %>%
+    summarize(total = sum(weekly_h, na.rm = TRUE)) %>%
+    pull(total)
+}
+
+# -----------------------------
+# Densify a single (route, direction, pattern) group of trips up to a
+# target trip count by inserting clones into existing gaps. Inserts are
+# allocated proportional to gap size (largest-remainder method) so the
+# longest headways are filled first.
+# -----------------------------
+densify_to_target <- function(gtfs, group_trips, target_count, id_prefix = "BOOST") {
+  group_trips <- group_trips %>% arrange(start_sec)
+  N <- nrow(group_trips)
+
+  empty_result <- list(
+    trips = gtfs$trips[0, , drop = FALSE],
+    stop_times = gtfs$stop_times[0, , drop = FALSE]
+  )
+
+  if (N < 2 || target_count <= N) return(empty_result)
+
+  n_to_insert <- as.integer(target_count - N)
+  n_gaps <- N - 1L
+
+  gaps <- diff(group_trips$start_sec)
+  total_gap <- sum(gaps)
+  if (!is.finite(total_gap) || total_gap <= 0) return(empty_result)
+
+  shares <- gaps / total_gap * n_to_insert
+  base_per_gap <- as.integer(floor(shares))
+  remainder <- as.integer(n_to_insert - sum(base_per_gap))
+  fractional <- shares - base_per_gap
+
+  if (remainder > 0L) {
+    extra_idx <- order(fractional, decreasing = TRUE)[seq_len(remainder)]
+    base_per_gap[extra_idx] <- base_per_gap[extra_idx] + 1L
+  }
+
+  st <- gtfs$stop_times %>%
+    mutate(
+      arr_sec = time_to_sec(arrival_time),
+      dep_sec = time_to_sec(departure_time)
+    )
+
+  new_trips <- list()
+  new_sts <- list()
+  ctr <- 0L
+
+  for (i in seq_len(n_gaps)) {
+    n_insert_here <- base_per_gap[i]
+    if (n_insert_here == 0L) next
+
+    t0 <- group_trips$start_sec[i]
+    t1 <- group_trips$start_sec[i + 1]
+    dt <- t1 - t0
+    if (is.na(dt) || dt <= 0) next
+
+    tpl_trip_id <- group_trips$trip_id[i]
+    tpl_trip <- gtfs$trips %>% filter(trip_id == tpl_trip_id)
+    tpl_st   <- st %>% filter(trip_id == tpl_trip_id) %>% arrange(stop_sequence)
+    if (nrow(tpl_trip) == 0 || nrow(tpl_st) == 0) next
+
+    multiplier_local <- n_insert_here + 1L
+    for (k in seq_len(n_insert_here)) {
+      ctr <- ctr + 1L
+      new_start <- t0 + round(dt * (k / multiplier_local))
+      shift <- new_start - t0
+
+      new_trip_id <- paste0(tpl_trip_id, "_", id_prefix, "_", sprintf("%06d", ctr), "_S", shift)
+
+      nt <- tpl_trip %>% mutate(trip_id = new_trip_id)
+
+      nst <- tpl_st %>%
+        mutate(
+          trip_id = new_trip_id,
+          arrival_time   = sec_to_time(arr_sec + shift),
+          departure_time = sec_to_time(dep_sec + shift)
+        ) %>%
+        select(-arr_sec, -dep_sec)
+
+      new_trips[[length(new_trips) + 1]] <- nt
+      new_sts[[length(new_sts) + 1]]     <- nst
+    }
+  }
+
+  list(
+    trips = bind_rows(new_trips),
+    stop_times = bind_rows(new_sts)
+  )
+}
+
+# -----------------------------
+# Apply per-route slowdown multipliers to stop_times. Scales each
+# segment running time by the route's multiplier; dwell times are kept.
+# Express overlay routes (whose route_id ends in _EXP) inherit the base
+# route's multiplier via suffix-stripping. Trips whose route has no
+# multiplier (or multiplier == 1) are passed through unchanged.
+# -----------------------------
+apply_av_slowdown <- function(gtfs, route_multipliers) {
+  trip_to_mult <- gtfs$trips %>%
+    select(trip_id, route_id) %>%
+    mutate(
+      route_id = as.character(route_id),
+      lookup_route_id = sub("_EXP$", "", route_id)
+    ) %>%
+    left_join(
+      route_multipliers %>%
+        rename(lookup_route_id = route_id),
+      by = "lookup_route_id"
+    ) %>%
+    mutate(multiplier = coalesce(multiplier, 1.0)) %>%
+    select(trip_id, multiplier)
+
+  st <- gtfs$stop_times %>%
+    arrange(trip_id, stop_sequence) %>%
+    mutate(
+      arr_sec = time_to_sec(arrival_time),
+      dep_sec = time_to_sec(departure_time)
+    )
+
+  mult_by_trip <- setNames(trip_to_mult$multiplier,
+                           as.character(trip_to_mult$trip_id))
+
+  trip_ids_chr <- as.character(st$trip_id)
+  trip_runs <- rle(trip_ids_chr)
+
+  arr <- st$arr_sec
+  dep <- st$dep_sec
+  affected <- logical(length(arr))
+
+  pb <- progress_bar$new(
+    format = "Slowing trips [:bar] :current/:total (:percent) | eta: :eta",
+    total = length(trip_runs$values),
+    clear = FALSE, width = 60
+  )
+
+  start_idx <- 1L
+  for (k in seq_along(trip_runs$values)) {
+    pb$tick()
+    n <- trip_runs$lengths[k]
+    end_idx <- start_idx + n - 1L
+
+    if (n >= 2L) {
+      tid <- trip_runs$values[k]
+      m <- mult_by_trip[[tid]]
+      if (!is.null(m) && !is.na(m) && m != 1.0) {
+        idx <- start_idx:end_idx
+        a_orig <- arr[idx]
+        d_orig <- dep[idx]
+        a_new  <- a_orig
+        d_new  <- d_orig
+
+        for (i in 2:n) {
+          if (is.na(a_orig[i]) || is.na(d_orig[i - 1L]) || is.na(d_new[i - 1L])) next
+
+          seg_orig <- a_orig[i] - d_orig[i - 1L]   # ORIGINAL segment running time
+          a_new[i] <- d_new[i - 1L] + seg_orig * m # chain on the NEW prev departure
+
+          dwell <- if (!is.na(d_orig[i]) && !is.na(a_orig[i])) {
+            max(0, d_orig[i] - a_orig[i])
+          } else 0
+          d_new[i] <- a_new[i] + dwell
+        }
+
+        arr[idx] <- a_new
+        dep[idx] <- d_new
+        affected[idx] <- TRUE
+      }
+    }
+
+    start_idx <- end_idx + 1L
+  }
+
+  st$arrival_time <- if_else(
+    affected & !is.na(arr),
+    sec_to_time(round(arr)),
+    st$arrival_time
+  )
+  st$departure_time <- if_else(
+    affected & !is.na(dep),
+    sec_to_time(round(dep)),
+    st$departure_time
+  )
+
+  gtfs$stop_times <- st %>% select(-arr_sec, -dep_sec)
+  gtfs
+}
+
+# -----------------------------
+# Thin trips down to a target count by removing evenly-spaced
+# intermediate trips. Mirror of densify_to_target: used when buses get
+# slower (AV congestion) so that total weekly service hours stay roughly
+# constant even though each trip takes longer. First and last trips of
+# each (service, route, direction, pattern) group are preserved so the
+# operating span is unchanged.
+# -----------------------------
+thin_eligible_to_factor <- function(gtfs, eligible_patterns, keep_factor) {
+  if (!is.finite(keep_factor) || keep_factor >= 1.0) return(gtfs)
+  if (keep_factor <= 0) {
+    warning("keep_factor <= 0; skipping thinning")
+    return(gtfs)
+  }
+
+  trips_w_starts <- compute_trip_starts(gtfs)
+
+  thin_groups <- trips_w_starts %>%
+    filter(!is.na(start_sec)) %>%
+    semi_join(eligible_patterns, by = c("route_id", "direction_id", "pattern_id")) %>%
+    group_by(service_id, route_id, direction_id, pattern_id) %>%
+    group_split(.keep = TRUE)
+
+  pb <- progress_bar$new(
+    format = "Thinning [:bar] :current/:total (:percent) | eta: :eta",
+    total = length(thin_groups),
+    clear = FALSE, width = 60
+  )
+
+  trip_ids_to_drop <- character(0)
+
+  for (grp in thin_groups) {
+    pb$tick()
+    N <- nrow(grp)
+    if (N < 2) next
+
+    target <- max(1L, as.integer(round(N * keep_factor)))
+    if (target >= N) next
+
+    grp_sorted <- grp %>% arrange(start_sec)
+    keep_idx <- unique(round(seq(1, N, length.out = target)))
+    drop_idx <- setdiff(seq_len(N), keep_idx)
+    trip_ids_to_drop <- c(trip_ids_to_drop, grp_sorted$trip_id[drop_idx])
+  }
+
+  if (length(trip_ids_to_drop) == 0) {
+    cat("  No trips removed (group sizes too small to thin meaningfully).\n")
+    return(gtfs)
+  }
+
+  trip_ids_to_drop <- unique(trip_ids_to_drop)
+  cat(sprintf("  Removed %s trips across eligible patterns\n",
+              format(length(trip_ids_to_drop), big.mark = ",")))
+
+  gtfs$trips <- gtfs$trips %>%
+    filter(!trip_id %in% trip_ids_to_drop)
+  gtfs$stop_times <- gtfs$stop_times %>%
+    filter(!trip_id %in% trip_ids_to_drop)
+
+  gtfs
+}
+
+# -----------------------------
+# Prune GTFS tables to referenced entities
+# -----------------------------
+prune_gtfs <- function(gtfs) {
+  # Keep only routes, trips, stop_times already filtered/modified;
+  # prune stops/shapes/transfers to match.
+  gtfs$routes <- gtfs$routes %>% filter(route_id %in% unique(gtfs$trips$route_id))
+  gtfs$shapes <- if ("shapes" %in% names(gtfs) && !is.null(gtfs$shapes)) {
+    gtfs$shapes %>% filter(shape_id %in% unique(na.omit(gtfs$trips$shape_id)))
+  } else gtfs$shapes
+
+  keep_stops <- unique(gtfs$stop_times$stop_id)
+  gtfs$stops <- gtfs$stops %>% filter(stop_id %in% keep_stops)
+
+  if ("transfers" %in% names(gtfs) && !is.null(gtfs$transfers)) {
+    gtfs$transfers <- gtfs$transfers %>%
+      filter(from_stop_id %in% keep_stops, to_stop_id %in% keep_stops)
+  }
+
+  if ("pathways" %in% names(gtfs) && !is.null(gtfs$pathways)) {
+    gtfs$pathways <- gtfs$pathways %>%
+      filter(from_stop_id %in% keep_stops, to_stop_id %in% keep_stops)
+  }
+
+  gtfs
+}
+```
+
+
+```{r}
+# ============================================================
+# Main function
+# ============================================================
+
+gtfs_zip_path <- "./data/gtfs/kcm/kcm_transit_april_26.zip"
+out_zip_path  <- "./data/gtfs/kcm/kcm_triplicate_april_26.zip"
+
+typical_weekday <- "wednesday"
+typical_weekend <- "saturday"
+output_year <- 2026L
+
+midday_window <- c("10:00:00", "14:00:00")
+allday_window <- c("06:00:00", "19:00:00")
+
+# Edit this list if your agency uses a different holiday calendar.
+# These are the 2026 U.S. federal holiday dates by actual date.
+holiday_dates_2026 <- as.Date(c(
+  "2026-01-01", # New Year's Day
+  "2026-01-19", # Martin Luther King Jr. Day
+  "2026-02-16", # Washington's Birthday
+  "2026-05-25", # Memorial Day
+  "2026-06-19", # Juneteenth
+  "2026-07-04", # Independence Day
+  "2026-09-07", # Labor Day
+  "2026-10-12", # Columbus Day / Indigenous Peoples' Day (agency-specific)
+  "2026-11-11", # Veterans Day
+  "2026-11-26", # Thanksgiving
+  "2026-12-25"  # Christmas
+))
+
+gtfs <- import_gtfs(gtfs_zip_path)
+
+# Expand frequencies.txt if present
+gtfs <- expand_frequencies_to_trips(gtfs)
+
+# Pick one representative weekday and one representative weekend date
+weekday_date <- pick_typical_service_date(gtfs, typical_weekday)
+weekend_date <- pick_typical_service_date(gtfs, typical_weekend)
+
+# Collapse the feed to exactly two service patterns
+gtfs <- collapse_to_two_service_patterns(
+  gtfs = gtfs,
+  weekday_date = weekday_date,
+  weekend_date = weekend_date,
+  holiday_dates = holiday_dates_2026,
+  year = output_year
+)
+
+# Add pattern_id and compute starts
+gtfs <- add_pattern_id(gtfs)
+
+# Snapshot the collapsed baseline (pre-triplication) for the TSP-only variant
+gtfs_baseline <- gtfs
+
+trips_w_starts <- compute_trip_starts(gtfs)
+
+weekday_service_id <- paste0("WEEKDAY_", output_year)
+weekend_service_id <- paste0("WEEKEND_HOLIDAY_", output_year)
+
+# Keep your existing weekday-driven headway logic
+trips_w_starts_weekday <- trips_w_starts %>%
+  filter(service_id == weekday_service_id)
+
+freq_tbl <- headway_summary(
+  trips_w_starts = trips_w_starts_weekday,
+  routes_tbl = gtfs$routes,
+  midday = midday_window,
+  allday = allday_window
+)
+
+eligible_patterns <- freq_tbl %>%
+  filter(trips_midday > 1) %>%
+  select(route_id, direction_id, pattern_id)
+
+```
+
+```{r}
+# Build new trips (densify locals) + express overlays
+add_trips_all <- list()
+add_st_all <- list()
+
+# For express overlays: we collect and add route/trip/stop_time rows
+add_routes_exp <- list()
+add_trips_exp  <- list()
+add_st_exp     <- list()
+
+
+# Precompute multiplier per route_id for O(1) lookup
+mult_by_route <- freq_tbl %>%
+  distinct(route_id, multiplier_local) %>%
+  mutate(multiplier_local = as.integer(multiplier_local))
+
+# Split trips once by the group key, then iterate over the list
+trips_split <- trips_w_starts %>%
+  filter(!is.na(start_sec)) %>%
+  semi_join(eligible_patterns, by = c("route_id", "direction_id", "pattern_id")) %>%
+  group_by(service_id, route_id, direction_id, pattern_id) %>%
+  group_split(.keep = TRUE)
+
+pb <- progress_bar$new(
+  format = "Densifying [:bar] :current/:total (:percent) | elapsed: :elapsed | eta: :eta",
+  total = length(trips_split),
+  clear = FALSE,
+  width = 60
+)
+
+for (grp_trips in trips_split) {
+  pb$tick()
+
+  # pull keys from the group's first row
+  route_id <- grp_trips$route_id[[1]]
+
+  # multiplier lookup (default 3)
+  mult <- mult_by_route$multiplier_local[match(route_id, mult_by_route$route_id)]
+  if (is.na(mult)) mult <- 3L
+
+  grp_trips <- grp_trips %>% arrange(start_sec)
+
+  dens <- densify_group(gtfs, grp_trips, multiplier = mult, id_prefix = "DENSE")
+
+  if (nrow(dens$trips) > 0) {
+    add_trips_all[[length(add_trips_all) + 1]] <- dens$trips
+    add_st_all[[length(add_st_all) + 1]]       <- dens$stop_times
+  }
+}
+
+# Apply local densification
+if (length(add_trips_all) > 0) {
+  gtfs$trips <- bind_rows(gtfs$trips, bind_rows(add_trips_all))
+  gtfs$stop_times <- bind_rows(gtfs$stop_times, bind_rows(add_st_all))
+}
+```
+
+```{r}
+# Express overlays for routes that are "all-day <= 10 min"
+express_routes <- freq_tbl %>%
+  filter(express_needed) %>%
+  distinct(route_id) %>%
+  pull(route_id)
+
+pb_exp <- progress_bar$new(
+  format = "Express overlays [:bar] :current/:total (:percent) | elapsed: :elapsed | eta: :eta",
+  total = length(express_routes),
+  clear = FALSE,
+  width = 60
+)
+
+for (rid in express_routes) {
+  pb_exp$tick()
+
+  exp <- make_express_overlay(
+    gtfs,
+    rid,
+    express_suffix = "_EXP"
+  )
+
+  add_routes_exp[[length(add_routes_exp) + 1]] <- exp$routes_add
+  add_trips_exp[[length(add_trips_exp) + 1]]   <- exp$trips_add
+  add_st_exp[[length(add_st_exp) + 1]]         <- exp$stop_times_add
+}
+
+if (length(add_routes_exp) > 0) {
+  gtfs$routes <- bind_rows(gtfs$routes, bind_rows(add_routes_exp))
+  gtfs$trips <- bind_rows(gtfs$trips, bind_rows(add_trips_exp))
+  gtfs$stop_times <- bind_rows(gtfs$stop_times, bind_rows(add_st_exp))
+}
+```
+
+```{r}
+
+# Prune tables to references (keeps feed consistent)
+gtfs <- prune_gtfs(gtfs)
+
+# Snapshot the triplicate for the downstream TSP+boost variant
+gtfs_triplicate <- gtfs
+
+# Export
+export_gtfs(gtfs, out_zip_path)
+
+list(
+  weekday_date = weekday_date,
+  weekend_date = weekend_date,
+  weekday_service_id = weekday_service_id,
+  weekend_service_id = weekend_service_id,
+  freq_table = freq_tbl,
+  out_path = out_zip_path
+)
+
+gtfs$calendar %>%
+  distinct(service_id, monday, tuesday, wednesday, thursday, friday, saturday, sunday, start_date, end_date) %>%
+  arrange(service_id)
+
+gtfs$calendar_dates %>%
+  arrange(date, service_id)
+
+```
+
+
+```{r}
+# ============================================================
+# Variant 2: Baseline + full TSP (transit lanes + signal priority)
+#
+# Approximates an end-to-end transit-priority network by replacing every
+# trip's segment timings with the fastest existing trip for the same
+# (route_id, direction_id, pattern_id) group -- typically a late-night /
+# early-morning trip with little traffic. Boardings on slower trips and
+# signals encountered by the fast trip are assumed to roughly cancel out.
+# ============================================================
+
+cat("\n===== Variant: Baseline + TSP =====\n")
+
+baseline_hours <- compute_service_hours(gtfs_baseline)
+cat(sprintf("Baseline weekly service hours:        %s\n",
+            format(round(baseline_hours, 1), big.mark = ",")))
+
+gtfs_baseline_tsp <- apply_tsp(gtfs_baseline)
+
+baseline_tsp_hours <- compute_service_hours(gtfs_baseline_tsp)
+baseline_savings_pct <- (1 - baseline_tsp_hours / baseline_hours) * 100
+
+cat(sprintf("Baseline + TSP weekly service hours:  %s\n",
+            format(round(baseline_tsp_hours, 1), big.mark = ",")))
+cat(sprintf("Service-hour savings from TSP:        %.2f%%\n",
+            baseline_savings_pct))
+
+gtfs_baseline_tsp <- prune_gtfs(gtfs_baseline_tsp)
+out_baseline_tsp <- "./data/gtfs/kcm/kcm_baseline_tsp_april_26.zip"
+export_gtfs(gtfs_baseline_tsp, out_baseline_tsp)
+cat(sprintf("Saved: %s\n", out_baseline_tsp))
+```
+
+
+```{r}
+# ============================================================
+# Variant 3: Triplicate + full TSP + frequency boost
+#
+# Apply TSP to the triplicate, then re-densify the eligible patterns by a
+# uniform boost factor so total weekly service hours land back near the
+# pre-TSP triplicate. Express overlays (which carry their own _EXP route_id)
+# and non-eligible patterns are not boosted, so the boost factor is
+# computed against the boostable subset to compensate.
+# ============================================================
+
+cat("\n===== Variant: Triplicate + TSP + boost =====\n")
+
+triplicate_hours <- compute_service_hours(gtfs_triplicate)
+cat(sprintf("Triplicate weekly service hours:        %s\n",
+            format(round(triplicate_hours, 1), big.mark = ",")))
+
+gtfs_triplicate_tsp <- apply_tsp(gtfs_triplicate)
+
+triplicate_tsp_hours <- compute_service_hours(gtfs_triplicate_tsp)
+triplicate_savings_pct <- (1 - triplicate_tsp_hours / triplicate_hours) * 100
+
+cat(sprintf("Triplicate + TSP weekly service hours:  %s\n",
+            format(round(triplicate_tsp_hours, 1), big.mark = ",")))
+cat(sprintf("Service-hour savings from TSP:          %.2f%%\n",
+            triplicate_savings_pct))
+
+# Identify trips that fall under the eligible_patterns from the triplicate
+# build (these are the only trips the boost will touch). Note: pattern_id was
+# recomputed inside apply_tsp(), but for trips inherited unchanged from the
+# baseline the recomputed pattern_id matches the original (digest is
+# deterministic over the same stop sequence), so the eligible_patterns
+# semi_join still resolves correctly.
+boost_trip_ids_triple <- gtfs_triplicate$trips %>%
+  semi_join(eligible_patterns, by = c("route_id", "direction_id", "pattern_id")) %>%
+  pull(trip_id)
+
+boost_trip_ids_tsp <- gtfs_triplicate_tsp$trips %>%
+  semi_join(eligible_patterns, by = c("route_id", "direction_id", "pattern_id")) %>%
+  pull(trip_id)
+
+boostable_triplicate_h <- compute_service_hours(gtfs_triplicate, boost_trip_ids_triple)
+boostable_tsp_h        <- compute_service_hours(gtfs_triplicate_tsp, boost_trip_ids_tsp)
+non_boostable_tsp_h    <- triplicate_tsp_hours - boostable_tsp_h
+
+cat(sprintf("\nBoostable subset (eligible patterns, no express overlays):\n"))
+cat(sprintf("  Triplicate boostable hours/wk:        %s\n",
+            format(round(boostable_triplicate_h, 1), big.mark = ",")))
+cat(sprintf("  Triplicate+TSP boostable hours/wk:    %s\n",
+            format(round(boostable_tsp_h, 1), big.mark = ",")))
+cat(sprintf("  Non-boostable TSP hours/wk (kept):    %s\n",
+            format(round(non_boostable_tsp_h, 1), big.mark = ",")))
+
+# Boost factor solves: boost_factor * boostable_tsp_h + non_boostable_tsp_h ~= triplicate_hours
+target_boostable_h <- triplicate_hours - non_boostable_tsp_h
+boost_factor <- if (boostable_tsp_h > 0) target_boostable_h / boostable_tsp_h else 1.0
+
+cat(sprintf("\nBoost factor applied to eligible patterns: %.4f\n", boost_factor))
+cat(sprintf("  -> targeting boostable hours of %s\n",
+            format(round(target_boostable_h, 1), big.mark = ",")))
+
+# Apply boost: for each (service, route, direction, pattern) group of the
+# eligible patterns, insert clones into the existing gaps to reach a target
+# trip count of round(N * boost_factor).
+trips_w_starts_tsp <- compute_trip_starts(gtfs_triplicate_tsp)
+
+boost_groups <- trips_w_starts_tsp %>%
+  filter(!is.na(start_sec)) %>%
+  semi_join(eligible_patterns, by = c("route_id", "direction_id", "pattern_id")) %>%
+  group_by(service_id, route_id, direction_id, pattern_id) %>%
+  group_split(.keep = TRUE)
+
+add_trips_boost <- list()
+add_st_boost    <- list()
+
+pb_boost <- progress_bar$new(
+  format = "Boosting [:bar] :current/:total (:percent) | elapsed: :elapsed | eta: :eta",
+  total = length(boost_groups),
+  clear = FALSE,
+  width = 60
+)
+
+for (grp_trips in boost_groups) {
+  pb_boost$tick()
+
+  N <- nrow(grp_trips)
+  target_count <- as.integer(round(N * boost_factor))
+  if (target_count <= N) next
+
+  grp_trips <- grp_trips %>% arrange(start_sec)
+
+  boost_res <- densify_to_target(
+    gtfs_triplicate_tsp, grp_trips, target_count,
+    id_prefix = "BOOST"
+  )
+
+  if (nrow(boost_res$trips) > 0) {
+    add_trips_boost[[length(add_trips_boost) + 1]] <- boost_res$trips
+    add_st_boost[[length(add_st_boost) + 1]]      <- boost_res$stop_times
+  }
+}
+
+if (length(add_trips_boost) > 0) {
+  gtfs_triplicate_tsp$trips <- bind_rows(
+    gtfs_triplicate_tsp$trips, bind_rows(add_trips_boost)
+  )
+  gtfs_triplicate_tsp$stop_times <- bind_rows(
+    gtfs_triplicate_tsp$stop_times, bind_rows(add_st_boost)
+  )
+}
+
+final_hours <- compute_service_hours(gtfs_triplicate_tsp)
+cat(sprintf("\nFinal triplicate+TSP+boost weekly hrs: %s (%.1f%% of triplicate)\n",
+            format(round(final_hours, 1), big.mark = ","),
+            final_hours / triplicate_hours * 100))
+
+gtfs_triplicate_tsp <- prune_gtfs(gtfs_triplicate_tsp)
+out_triplicate_tsp <- "./data/gtfs/kcm/kcm_triplicate_tsp_april_26.zip"
+export_gtfs(gtfs_triplicate_tsp, out_triplicate_tsp)
+cat(sprintf("Saved: %s\n", out_triplicate_tsp))
+```
+
+```{r av-variants}
+# ============================================================
+# Variants 4 & 5: Baseline + AV congestion / Triplicate + AV congestion
+#
+# Each KCM route is slowed by a per-route multiplier read from
+# data/own/kcm_av_route_slowdown.csv. The multipliers were generated once,
+# with a preliminary road-congestion model of AV-induced traffic: for each
+# route, the length-weighted mean of (congested / free-flow link time) over the
+# road links within 30 ft of the route's most-served shape. Each trip's segment
+# running times (arrival[i] - departure[i-1]) are scaled by the multiplier;
+# dwell times are kept. Routes with no multiplier are left unchanged.
+#
+# Express overlay routes (route_id ending in _EXP) inherit the multiplier
+# of their base route via suffix-stripping inside apply_av_slowdown().
+# ============================================================
+
+cat("\n===== Variants: Baseline + AV / Triplicate + AV =====\n")
+
+av_multipliers <- readr::read_csv("./data/own/kcm_av_route_slowdown.csv",
+                                  col_types = "cd", show_col_types = FALSE) %>%
+  rename(multiplier = av_slowdown_multiplier)
+
+cat("\nRoute-level AV slowdown multiplier:\n")
+print(summary(av_multipliers$multiplier))
+
+# Helper closure: given a "before" GTFS (target hours), an "after-AV-slowdown"
+# GTFS, the target total weekly hours, and eligible_patterns, compute the
+# keep_factor that brings the eligible-pattern subset back down so total
+# hours land near `target_hours`. Mirrors the boost-factor logic from the
+# TSP+boost chunk: non-eligible patterns are slowed but not thinned, so
+# the eligible subset has to absorb the full compensation.
+compute_keep_factor <- function(gtfs_before, gtfs_av, target_hours,
+                                total_av_hours, eligible_patterns) {
+  elig_trip_ids_av <- gtfs_av$trips %>%
+    semi_join(eligible_patterns, by = c("route_id", "direction_id", "pattern_id")) %>%
+    pull(trip_id)
+  elig_trip_ids_before <- gtfs_before$trips %>%
+    semi_join(eligible_patterns, by = c("route_id", "direction_id", "pattern_id")) %>%
+    pull(trip_id)
+
+  elig_av_h     <- compute_service_hours(gtfs_av,     elig_trip_ids_av)
+  elig_before_h <- compute_service_hours(gtfs_before, elig_trip_ids_before)
+  non_elig_av_h <- total_av_hours - elig_av_h
+
+  target_elig_h <- target_hours - non_elig_av_h
+  keep_factor   <- if (elig_av_h > 0) target_elig_h / elig_av_h else 1.0
+
+  list(
+    elig_before_h = elig_before_h,
+    elig_av_h     = elig_av_h,
+    non_elig_av_h = non_elig_av_h,
+    target_elig_h = target_elig_h,
+    keep_factor   = keep_factor
+  )
+}
+
+# --- Baseline + AV ---
+cat("\n--- Applying AV slowdown to baseline ---\n")
+gtfs_baseline_av <- apply_av_slowdown(gtfs_baseline, av_multipliers)
+
+baseline_av_hours_pre <- compute_service_hours(gtfs_baseline_av)
+cat(sprintf("Baseline + AV weekly service hours (pre-thin):   %s (%+.2f%% vs baseline)\n",
+            format(round(baseline_av_hours_pre, 1), big.mark = ","),
+            (baseline_av_hours_pre / baseline_hours - 1) * 100))
+
+# Hold service hours constant by removing trips on eligible patterns
+kf_baseline <- compute_keep_factor(
+  gtfs_before    = gtfs_baseline,
+  gtfs_av        = gtfs_baseline_av,
+  target_hours   = baseline_hours,
+  total_av_hours = baseline_av_hours_pre,
+  eligible_patterns = eligible_patterns
+)
+
+cat(sprintf("\nBoostable subset (eligible patterns):\n"))
+cat(sprintf("  Baseline eligible hours/wk:           %s\n",
+            format(round(kf_baseline$elig_before_h, 1), big.mark = ",")))
+cat(sprintf("  Baseline+AV eligible hours/wk:        %s\n",
+            format(round(kf_baseline$elig_av_h, 1), big.mark = ",")))
+cat(sprintf("  Non-eligible AV hours/wk (kept):      %s\n",
+            format(round(kf_baseline$non_elig_av_h, 1), big.mark = ",")))
+cat(sprintf("\nKeep factor applied to eligible patterns: %.4f\n",
+            kf_baseline$keep_factor))
+cat(sprintf("  -> targeting eligible hours of %s\n",
+            format(round(kf_baseline$target_elig_h, 1), big.mark = ",")))
+
+gtfs_baseline_av <- thin_eligible_to_factor(
+  gtfs_baseline_av, eligible_patterns, kf_baseline$keep_factor
+)
+
+baseline_av_hours <- compute_service_hours(gtfs_baseline_av)
+cat(sprintf("\nFinal baseline+AV weekly hrs: %s (%.1f%% of baseline)\n",
+            format(round(baseline_av_hours, 1), big.mark = ","),
+            baseline_av_hours / baseline_hours * 100))
+
+gtfs_baseline_av <- prune_gtfs(gtfs_baseline_av)
+out_baseline_av <- "./data/gtfs/kcm/kcm_baseline_av_april_26.zip"
+export_gtfs(gtfs_baseline_av, out_baseline_av)
+cat(sprintf("Saved: %s\n", out_baseline_av))
+
+# --- Triplicate + AV ---
+cat("\n--- Applying AV slowdown to triplicate ---\n")
+gtfs_triplicate_av <- apply_av_slowdown(gtfs_triplicate, av_multipliers)
+
+triplicate_av_hours_pre <- compute_service_hours(gtfs_triplicate_av)
+cat(sprintf("Triplicate + AV weekly service hours (pre-thin): %s (%+.2f%% vs triplicate)\n",
+            format(round(triplicate_av_hours_pre, 1), big.mark = ","),
+            (triplicate_av_hours_pre / triplicate_hours - 1) * 100))
+
+kf_triplicate <- compute_keep_factor(
+  gtfs_before    = gtfs_triplicate,
+  gtfs_av        = gtfs_triplicate_av,
+  target_hours   = triplicate_hours,
+  total_av_hours = triplicate_av_hours_pre,
+  eligible_patterns = eligible_patterns
+)
+
+cat(sprintf("\nBoostable subset (eligible patterns):\n"))
+cat(sprintf("  Triplicate eligible hours/wk:         %s\n",
+            format(round(kf_triplicate$elig_before_h, 1), big.mark = ",")))
+cat(sprintf("  Triplicate+AV eligible hours/wk:      %s\n",
+            format(round(kf_triplicate$elig_av_h, 1), big.mark = ",")))
+cat(sprintf("  Non-eligible AV hours/wk (kept):      %s\n",
+            format(round(kf_triplicate$non_elig_av_h, 1), big.mark = ",")))
+cat(sprintf("\nKeep factor applied to eligible patterns: %.4f\n",
+            kf_triplicate$keep_factor))
+cat(sprintf("  -> targeting eligible hours of %s\n",
+            format(round(kf_triplicate$target_elig_h, 1), big.mark = ",")))
+
+gtfs_triplicate_av <- thin_eligible_to_factor(
+  gtfs_triplicate_av, eligible_patterns, kf_triplicate$keep_factor
+)
+
+triplicate_av_hours <- compute_service_hours(gtfs_triplicate_av)
+cat(sprintf("\nFinal triplicate+AV weekly hrs: %s (%.1f%% of triplicate)\n",
+            format(round(triplicate_av_hours, 1), big.mark = ","),
+            triplicate_av_hours / triplicate_hours * 100))
+
+gtfs_triplicate_av <- prune_gtfs(gtfs_triplicate_av)
+out_triplicate_av <- "./data/gtfs/kcm/kcm_triplicate_av_april_26.zip"
+export_gtfs(gtfs_triplicate_av, out_triplicate_av)
+cat(sprintf("Saved: %s\n", out_triplicate_av))
+```

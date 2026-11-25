@@ -1,0 +1,159 @@
+---
+title: "Sensitivity analysis - one factor at a time over five Phase 2 constants"
+output: html_document
+params:
+  scenario_pipeline: "Phase2RunSimulation.Rmd"   # the Phase 2 notebook to render
+  baseline_config:   "baseline__no_pri_no_av"      # Vision Zero denominator
+  treatment_config:  "grid_local__pri_av"          # the policy scenario of interest
+  tod:               "AM"                           # single time of day for the whole study
+  sens_root:  "./outputs/sensitivity"   # one subfolder of Phase 2 CSVs per render point
+  cache_dir:  "./cache"                 # shared across renders (reuses skims and networks)
+  force_rerun:  false                   # TRUE = re-render even if a point's CSVs exist
+  java_heap_gb: 20
+  vz_baseline_fatalities: 29.4
+  vz_hughes_elasticity:   1.0
+  vz_nilsson_exp_fatal:   3.0
+---
+
+One-factor-at-a-time (OFAT) sensitivity around the published Phase 2 constants,
+for one time of day and two configurations: the baseline (existing network,
+current streets; also the Vision Zero denominator) and the treatment (Grid +
+Local, transit priority, AV-induced traffic).
+
+Three constants act through the road equilibrium, so each value is a fresh
+render of `Phase2RunSimulation.Rmd` restricted to the two configurations:
+`av_drive_tt_shrink`, `bpr_vc_cap`, `auto_occupancy`. The two Vision Zero
+exponents (`vz_nilsson_exp_fatal`, `vz_hughes_elasticity`) are pure arithmetic on
+the base render's VMT and speed ratios, so they need no renders.
+
+Outputs (read by `ThesisTables.Rmd` and `ThesisFigures.Rmd`):
+
+* `outputs/sensitivity/sensitivity_metrics.csv` - one row per (render point,
+  configuration): mode shares, speed, VMT, 30-minute job accessibility, and the
+  treatment's projected fatalities.
+* `outputs/sensitivity/vz_exponent_sweep.csv` - projected treatment fatalities
+  over the exponent grid.
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(purrr)
+})
+SENS_ROOT <- normalizePath(params$sens_root, mustWork = FALSE)
+dir.create(SENS_ROOT, recursive = TRUE, showWarnings = FALSE)
+CONFIGS   <- c(params$baseline_config, params$treatment_config)
+fs_path   <- function(p) gsub("\\\\", "/", p)
+```
+
+# The OFAT grid
+
+```{r grid}
+base_vals <- list(av_drive_tt_shrink = 0.41, bpr_vc_cap = 2.0, auto_occupancy = 1.10)
+sweeps <- list(
+  av_drive_tt_shrink = c(0.25, 0.41, 0.60, 0.80),
+  bpr_vc_cap         = c(1.5, 2.0, 3.0),
+  auto_occupancy     = c(1.00, 1.10, 1.25))
+v_tag <- function(v) gsub("\\.", "p", formatC(v, format = "f", drop0trailing = TRUE))
+
+plan <- imap_dfr(sweeps, function(vals, pname) tibble(param_name = pname, param_value = vals)) |>
+  mutate(is_base = map2_lgl(param_name, param_value, ~ isTRUE(all.equal(.y, base_vals[[.x]]))),
+         tag = if_else(is_base, "base",
+                       sprintf("%s_%s", param_name, vapply(param_value, v_tag, ""))))
+# The base point is shared by all three sweeps, so it is rendered once.
+render_points <- plan |> distinct(tag, .keep_all = TRUE) |>
+  mutate(param_name = if_else(is_base, "(base)", param_name))
+render_points
+```
+
+# Renders
+
+Each render is a fresh R process (clean r5r Java VM) with all three constants
+pinned explicitly; an off-base point overrides just one of them.
+
+```{r renders}
+rscript <- file.path(R.home("bin"), if (.Platform$OS.type == "windows") "Rscript.exe" else "Rscript")
+needed_csvs <- c("mode_share_by_config_tod.csv", "vmt_speed_by_config_tod.csv",
+                 "employment_accessibility_by_tract_mode_tod.csv")
+
+for (i in seq_len(nrow(render_points))) {
+  rp <- render_points[i, ]
+  out_dir <- file.path(SENS_ROOT, rp$tag)
+  if (!params$force_rerun && all(file.exists(file.path(out_dir, needed_csvs)))) next
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  ov <- base_vals
+  if (!rp$is_base) ov[[rp$param_name]] <- rp$param_value
+  plist <- c(list(cache_dir = fs_path(normalizePath(params$cache_dir)),
+                  output_dir = fs_path(normalizePath(out_dir)),
+                  tods_to_run = params$tod, configs_filter = CONFIGS,
+                  java_heap_gb = as.integer(params$java_heap_gb)), ov)
+  driver <- tempfile(fileext = ".R")
+  writeLines(c(
+    "options(warn = 1)",
+    sprintf("rmarkdown::render(%s, output_format = 'html_document', run_pandoc = FALSE,",
+            deparse(params$scenario_pipeline)),
+    sprintf("  quiet = TRUE, envir = new.env(), params = %s)",
+            paste(deparse(plist), collapse = " "))), driver)
+  message(sprintf("render %s (%s = %s)", rp$tag, rp$param_name, rp$param_value))
+  status <- system2(rscript, shQuote(driver))
+  if (!identical(status, 0L) || !all(file.exists(file.path(out_dir, needed_csvs))))
+    stop("Sensitivity render failed: ", rp$tag)
+}
+```
+
+# Collect metrics
+
+Accessibility is the tract mean of jobs reachable within 30 minutes. The
+treatment's fatalities at each point are projected against the baseline at the
+same constant value: `29.4 x (VMT ratio)^Hughes x (speed ratio)^Nilsson`.
+
+```{r collect}
+read_point <- function(tag) {
+  d  <- file.path(SENS_ROOT, tag)
+  ms <- read_csv(file.path(d, needed_csvs[1]), show_col_types = FALSE) |>
+    filter(tod == params$tod, config_id %in% CONFIGS) |>
+    select(config_id, drive, transit, walk, bike)
+  vs <- read_csv(file.path(d, needed_csvs[2]), show_col_types = FALSE) |>
+    filter(tod == params$tod, config_id %in% CONFIGS) |>
+    select(config_id, avg_speed_mph, vmt_peakhr, pct_vmt_on_overcap)
+  ac <- read_csv(file.path(d, needed_csvs[3]), show_col_types = FALSE) |>
+    filter(tod == params$tod, config_id %in% CONFIGS, mode %in% c("drive", "transit")) |>
+    group_by(config_id, mode) |>
+    summarise(jobs_30min = mean(jobs_30min, na.rm = TRUE), .groups = "drop") |>
+    pivot_wider(names_from = mode, values_from = jobs_30min, names_prefix = "jobs_30min_")
+  ms |> left_join(vs, by = "config_id") |> left_join(ac, by = "config_id") |>
+    mutate(tag = tag, .before = 1)
+}
+
+metrics <- map_dfr(render_points$tag, read_point) |>
+  left_join(render_points |> select(tag, param_name, param_value, is_base), by = "tag") |>
+  mutate(role = if_else(config_id == params$baseline_config, "baseline", "treatment"))
+
+ratios <- metrics |>
+  select(tag, role, vmt_peakhr, avg_speed_mph) |>
+  pivot_wider(names_from = role, values_from = c(vmt_peakhr, avg_speed_mph)) |>
+  transmute(tag,
+            vmt_ratio   = vmt_peakhr_treatment / vmt_peakhr_baseline,
+            speed_ratio = avg_speed_mph_treatment / avg_speed_mph_baseline)
+
+metrics <- metrics |>
+  left_join(ratios, by = "tag") |>
+  mutate(fatalities = if_else(role == "baseline", params$vz_baseline_fatalities,
+                              params$vz_baseline_fatalities *
+                                vmt_ratio^params$vz_hughes_elasticity *
+                                speed_ratio^params$vz_nilsson_exp_fatal))
+write_csv(metrics, file.path(SENS_ROOT, "sensitivity_metrics.csv"))
+metrics |> select(tag, role, drive, transit, avg_speed_mph, fatalities)
+```
+
+# Vision Zero exponent sweep (no renders)
+
+```{r vz-sweep}
+base_r <- ratios |> filter(tag == "base")
+vz_sweep <- crossing(nilsson = c(2.0, 3.0, 4.0, 4.5), hughes = c(0.5, 1.0, 1.2)) |>
+  mutate(vmt_ratio = base_r$vmt_ratio, speed_ratio = base_r$speed_ratio,
+         fatalities = params$vz_baseline_fatalities * vmt_ratio^hughes * speed_ratio^nilsson,
+         pct_vs_baseline = 100 * (fatalities / params$vz_baseline_fatalities - 1),
+         is_base = nilsson == params$vz_nilsson_exp_fatal & hughes == params$vz_hughes_elasticity)
+write_csv(vz_sweep, file.path(SENS_ROOT, "vz_exponent_sweep.csv"))
+vz_sweep
+```

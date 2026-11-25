@@ -1,0 +1,510 @@
+---
+title: "Thesis tables"
+output: html_document
+params:
+  phase1_dir:   "outputs/phase1"
+  phase2_dir:   "outputs/phase2"
+  node_dir:     "outputs/node_design"
+  sens_dir:     "outputs/sensitivity"
+  kcm_gtfs_dir:      "data/gtfs/kcm"
+  designed_gtfs_dir: "outputs/gtfs"
+  cache_dir:    "cache"
+  hts_trips_csv: "data/public/psrc_hts/hts_trips.csv"
+  hts_households_csv: "data/public/psrc_hts/hts_households.csv"
+  daysim_trips_tsv:  "data/public/soundcast/_trip.tsv"
+  daysim_parcel_map: "data/public/soundcast/parcel_2023_geography.csv"
+  collisions_url: "https://services.arcgis.com/ZOyb2t4B0UYuYNYH/arcgis/rest/services/SDOT_Collisions_All_Years_1/FeatureServer/0/query"
+  acs_year:     2023
+  out_dir:      "outputs/tables"
+---
+
+Builds every data-driven table in the thesis from the pipeline's outputs and
+writes each one to `outputs/tables/table_NN_<name>.csv` (numbers formatted as
+in the thesis). Tables that are definitions rather than results (1, 3-7, 11,
+13, 25) are not generated.
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(stringr); library(purrr)
+  library(data.table); library(sf); library(lubridate); library(gtfsio)
+})
+options(tigris_use_cache = TRUE)
+dir.create(params$out_dir, recursive = TRUE, showWarnings = FALSE)
+
+save_table <- function(df, name) {
+  write_csv(df, file.path(params$out_dir, paste0(name, ".csv")), na = "")
+  knitr::kable(df, caption = name)
+}
+p2 <- function(f) read_csv(file.path(params$phase2_dir, f), show_col_types = FALSE)
+latest_cache <- function(label) {
+  f <- list.files(params$cache_dir, sprintf("^%s_[0-9a-f]+\\.rds$", label), full.names = TRUE)
+  if (!length(f)) stop("No cache file for ", label, " - run Phase1BuildMNL.Rmd first.")
+  readRDS(f[which.max(file.info(f)$mtime)])
+}
+pct  <- function(x, d = 1) sprintf(paste0("%.", d, "f%%"), 100 * x)
+sgn  <- function(x, d = 1, unit = "%") paste0(sprintf(paste0("%+.", d, "f"), x), unit)
+
+# Layout of the results tables: transit networks down, street scenarios across.
+NETWORKS <- c(baseline = "Baseline", triplicate = "Simple 3x", grid = "Grid-Based",
+              grid_local = "Grid + Local", node = "Node-Based")
+STREETS  <- c(no_pri_no_av = "Current Traffic and Transit Priority",
+              no_pri_av    = "Automated Vehicle-Induced Traffic",
+              pri_no_av    = "Full Transit Priority Current Traffic",
+              pri_av       = "Full Transit Priority and AV-Induced Traffic")
+BASE_CFG <- "baseline__no_pri_no_av"
+grid_table <- function(values, streets = names(STREETS)) {
+  # values: named character vector config_id -> cell text
+  out <- tibble(`Transit Network` = unname(NETWORKS))
+  for (s in streets) {
+    ids <- paste0(names(NETWORKS), "__", s)
+    out[[STREETS[[s]]]] <- ifelse(ids %in% names(values), values[ids], "---")
+  }
+  out
+}
+summ <- p2("summary_for_thesis.csv")
+```
+
+# Table 2. Observed mode share for all intra-Seattle trips (HTS, unweighted)
+
+Intra-Seattle = both trip ends in a census tract that intersects the Seattle
+place boundary (the Phase 1 definition). "Used" = the mode enters the
+mode-choice model.
+
+```{r table-02}
+tracts_sf  <- latest_cache("tracts_sf")
+seattle_sf <- latest_cache("seattle_place")
+seattle_ids <- tracts_sf$GEOID[lengths(st_intersects(st_transform(tracts_sf, st_crs(seattle_sf)), seattle_sf)) > 0]
+geoid11 <- function(x) substr(str_pad(str_replace_all(as.character(x), "[^0-9]", ""), 11, pad = "0"), 1, 11)
+
+hts <- fread(params$hts_trips_csv, select = c("trip_id", "mode_class", "origin_tract20",
+                                               "dest_tract20", "trip_weight"))
+hts[, `:=`(o = geoid11(origin_tract20), d = geoid11(dest_tract20))]
+intra <- hts[o %in% seattle_ids & d %in% seattle_ids]
+used_modes <- c("Walk", "Bike", "Micromobility", "Drive SOV", "Drive HOV2", "Drive HOV3+",
+                "Ride Hail", "Transit")
+order_modes <- c(used_modes, "School Bus", "Other", "Missing Response")
+t2 <- intra[, .N, by = mode_class][, share := N / sum(N)][
+  , .(Mode = mode_class, Trips = format(N, big.mark = ",", trim = TRUE),
+      `Used in Model` = ifelse(mode_class %in% used_modes, "Yes", "No"), Share = pct(share))]
+t2 <- t2[match(order_modes, Mode)][!is.na(Mode)]
+save_table(t2, "table_02_observed_mode_share")
+```
+
+# Table 8. Coverage by count of nodes
+
+Unconstrained p-median sweep written by `GenerateNodeGTFS.Rmd`.
+
+```{r table-08}
+ps <- read_csv(file.path(params$node_dir, "pmedian_sensitivity.csv"), show_col_types = FALSE) |>
+  arrange(p)
+t8 <- ps |> transmute(
+  `Number of Nodes` = p,
+  `Weighted Average Miles` = sprintf("%.2f", weighted_avg_mi),
+  `% Improvement` = c("---", sprintf("%.1f%%", 100 * (weighted_avg_mi[-1] / weighted_avg_mi[-n()] - 1))),
+  `% of Parcels Within 0.25 Miles` = sprintf("%.1f%%", pct_within_0_25),
+  `% of Parcels Within 0.5 Miles`  = sprintf("%.1f%%", pct_within_0_5))
+save_table(t8, "table_08_coverage_by_node_count")
+```
+
+# Table 9. Number of nodes in each generated corridor candidate
+
+```{r table-09}
+cd <- readRDS(file.path(params$node_dir, "corridor_design.rds"))
+n_nodes <- vapply(cd$candidates, function(c) length(c$sequence), integer(1))
+t9 <- as_tibble(as.list(table(n_nodes))) |> mutate(across(everything(), as.integer))
+t9 <- bind_cols(tibble(`Number of Nodes` = "Number of Routes"), t9)
+save_table(t9, "table_09_corridor_candidates_by_nodes")
+```
+
+# Table 10. Summary characteristics of all transit networks
+
+Per network (the feeds Phase 2 routes on, existing networks in their no-priority
+and priority forms), over a typical Wednesday:
+
+* **Peak hour vehicles** - for every route, the peak number of trips
+  simultaneously running between Seattle stops (an interval sweep over trip
+  segments inside the city; no layover), summed over routes.
+* **Median speed** - route length / median one-way running time, median over routes.
+* **Median headway** - per route, the median gap between trip starts in its
+  busiest hour (shortest over directions), median over routes.
+* **Median route length** - median shape length per route, median over routes.
+
+```{r table-10-helpers}
+time_to_sec <- function(x) {
+  x <- as.character(x); out <- rep(NA_integer_, length(x)); ok <- !is.na(x) & nzchar(x)
+  p <- str_split_fixed(x[ok], ":", 3)
+  out[ok] <- as.integer(p[, 1]) * 3600L + as.integer(p[, 2]) * 60L + as.integer(p[, 3])
+  out
+}
+sec_to_time <- function(s) { s <- as.integer(s); sprintf("%d:%02d:%02d", s %/% 3600L, (s %% 3600L) %/% 60L, s %% 60L) }
+
+# A typical Wednesday in the feed, preferring one with no calendar_dates exceptions.
+pick_service_date <- function(gtfs, weekday = "wednesday") {
+  target <- match(weekday, c("sunday","monday","tuesday","wednesday","thursday","friday","saturday")) - 1L
+  if (!is.null(gtfs$calendar) && nrow(gtfs$calendar) > 0) {
+    cal <- gtfs$calendar |> mutate(start_date = ymd(start_date), end_date = ymd(end_date))
+    cands <- seq.Date(min(cal$start_date), max(cal$end_date), by = "day")
+    cands <- cands[(wday(cands) - 1L) == target]
+    if (!is.null(gtfs$calendar_dates) && nrow(gtfs$calendar_dates) > 0) {
+      ex <- ymd(gtfs$calendar_dates$date)
+      n_ex <- vapply(cands, function(d) sum(ex == d), integer(1))
+      return(if (any(n_ex == 0L)) cands[which(n_ex == 0L)[1]] else cands[which.min(n_ex)])
+    }
+    return(cands[1])
+  }
+  cd <- ymd(gtfs$calendar_dates$date)
+  sort(unique(cd[(wday(cd) - 1L) == target]))[1]
+}
+services_on <- function(gtfs, date) {
+  active <- character()
+  if (!is.null(gtfs$calendar) && nrow(gtfs$calendar) > 0) {
+    cal <- gtfs$calendar |> mutate(start_date = ymd(start_date), end_date = ymd(end_date))
+    active <- cal |> filter(start_date <= date, end_date >= date,
+                            .data[[tolower(weekdays(date))]] == 1) |> pull(service_id)
+  }
+  if (!is.null(gtfs$calendar_dates) && nrow(gtfs$calendar_dates) > 0) {
+    cd <- gtfs$calendar_dates |> mutate(date = ymd(date)) |> filter(date == !!date)
+    active <- setdiff(union(active, cd$service_id[cd$exception_type == 1]),
+                      cd$service_id[cd$exception_type == 2])
+  }
+  unique(active)
+}
+# Expand frequencies.txt into explicit trips (the designed networks are frequency-based).
+expand_frequencies <- function(gtfs) {
+  if (is.null(gtfs$frequencies) || nrow(gtfs$frequencies) == 0) return(gtfs)
+  fr <- gtfs$frequencies |> mutate(s = time_to_sec(start_time), e = time_to_sec(end_time),
+                                   h = as.integer(headway_secs))
+  st <- gtfs$stop_times |> mutate(arr = time_to_sec(arrival_time), dep = time_to_sec(departure_time))
+  first_dep <- st |> group_by(trip_id) |> summarise(f = min(dep, na.rm = TRUE), .groups = "drop")
+  new_tr <- list(); new_st <- list()
+  for (i in seq_len(nrow(fr))) {
+    f <- fr[i, ]; tpl_tr <- gtfs$trips[gtfs$trips$trip_id == f$trip_id, ]
+    tpl_st <- st[st$trip_id == f$trip_id, ]; f0 <- first_dep$f[first_dep$trip_id == f$trip_id]
+    for (k in seq(f$s, f$e - f$h, by = f$h)) {
+      id <- sprintf("%s_F%04d_%06d", f$trip_id, i, k); sh <- k - f0
+      new_tr[[length(new_tr) + 1]] <- mutate(tpl_tr, trip_id = id)
+      new_st[[length(new_st) + 1]] <- tpl_st |>
+        mutate(trip_id = id, arrival_time = sec_to_time(arr + sh), departure_time = sec_to_time(dep + sh)) |>
+        select(-arr, -dep)
+    }
+  }
+  kill <- unique(fr$trip_id)
+  gtfs$trips <- bind_rows(gtfs$trips[!gtfs$trips$trip_id %in% kill, ], bind_rows(new_tr))
+  gtfs$stop_times <- bind_rows(gtfs$stop_times[!gtfs$stop_times$trip_id %in% kill, ], bind_rows(new_st))
+  gtfs$frequencies <- NULL
+  gtfs
+}
+peak_headway_sec <- function(starts) {
+  starts <- starts[is.finite(starts)]; if (length(starts) < 2) return(NA_real_)
+  hr <- floor(starts / 3600); pk <- as.integer(names(which.max(table(hr))))
+  x <- sort(starts[hr == pk]); if (length(x) < 2) NA_real_ else as.numeric(median(diff(x)))
+}
+haversine_m <- function(lon1, lat1, lon2, lat2) {
+  la1 <- lat1 * pi / 180; la2 <- lat2 * pi / 180
+  a <- sin((la2 - la1) / 2)^2 + cos(la1) * cos(la2) * sin((lon2 - lon1) * pi / 360)^2
+  2 * 6371008.8 * asin(pmin(1, sqrt(a)))
+}
+sweep_peak <- function(starts, ends) {
+  ok <- is.finite(starts) & is.finite(ends) & ends > starts
+  n <- sum(ok); if (!n) return(0L)
+  ev <- data.frame(t = c(starts[ok], ends[ok]), d = c(rep(1L, n), rep(-1L, n)))
+  ev <- ev[order(ev$t, ev$d), ]           # an end before a start at the same instant = one vehicle
+  as.integer(max(cumsum(ev$d)))
+}
+
+# Seattle = King County 2020 tracts whose centroid lies in the Seattle place.
+seattle_place <- tigris::places(state = "WA", year = 2020, cb = TRUE) |>
+  filter(NAME == "Seattle") |> st_transform(4326)
+king <- tigris::tracts(state = "WA", county = "King", year = 2020, cb = TRUE) |> st_transform(4326)
+seattle_poly <- king[st_within(st_centroid(king), seattle_place, sparse = FALSE)[, 1], ] |>
+  st_union() |> st_make_valid()
+
+route_stats <- function(zip) {
+  gtfs <- expand_frequencies(gtfsio::import_gtfs(zip))
+  day  <- pick_service_date(gtfs)
+  trips <- gtfs$trips |> filter(service_id %in% services_on(gtfs, day))
+  stops <- gtfs$stops |> mutate(stop_lat = as.numeric(stop_lat), stop_lon = as.numeric(stop_lon)) |>
+    filter(!is.na(stop_lat)) |> st_as_sf(coords = c("stop_lon", "stop_lat"), crs = 4326)
+  in_sea <- stops$stop_id[st_within(stops, seattle_poly, sparse = FALSE)[, 1]]
+  st <- gtfs$stop_times |> filter(trip_id %in% trips$trip_id) |>
+    mutate(arr = time_to_sec(arrival_time), dep = time_to_sec(departure_time),
+           stop_sequence = as.integer(stop_sequence), in_sea = stop_id %in% in_sea) |>
+    arrange(trip_id, stop_sequence) |>
+    group_by(trip_id) |> mutate(block = cumsum(is.na(lag(in_sea)) | lag(in_sea) != in_sea)) |> ungroup()
+  # in-Seattle segments of each trip (>= 2 stops) -> peak simultaneous trips per route
+  blocks <- st |> filter(in_sea) |> group_by(trip_id, block) |>
+    summarise(n = n(), s = first(coalesce(dep, arr)), e = last(coalesce(arr, dep)), .groups = "drop") |>
+    filter(n >= 2, e > s) |> inner_join(trips |> select(trip_id, route_id), by = "trip_id")
+  veh <- blocks |> group_by(route_id) |> summarise(vehicles = sweep_peak(s, e), .groups = "drop")
+  meta <- st |> group_by(trip_id) |>
+    summarise(start = min(coalesce(dep, arr), na.rm = TRUE), end = max(coalesce(arr, dep), na.rm = TRUE),
+              .groups = "drop") |>
+    inner_join(trips |> select(trip_id, route_id, any_of("direction_id"), any_of("shape_id")), by = "trip_id")
+  if (!"direction_id" %in% names(meta)) meta$direction_id <- 0L
+  hw <- meta |> group_by(route_id, direction_id) |> summarise(h = peak_headway_sec(start), .groups = "drop") |>
+    group_by(route_id) |> summarise(headway_min = suppressWarnings(min(h[h > 0], na.rm = TRUE)) / 60, .groups = "drop") |>
+    mutate(headway_min = ifelse(is.finite(headway_min), headway_min, NA_real_))
+  run <- meta |> filter(end > start) |> group_by(route_id) |>
+    summarise(run_sec = median(end - start), .groups = "drop")
+  shp <- gtfs$shapes |> mutate(lat = as.numeric(shape_pt_lat), lon = as.numeric(shape_pt_lon),
+                               seq = as.numeric(shape_pt_sequence)) |>
+    arrange(shape_id, seq) |> group_by(shape_id) |>
+    summarise(m = sum(haversine_m(lag(lon), lag(lat), lon, lat), na.rm = TRUE), .groups = "drop")
+  len <- meta |> distinct(route_id, shape_id) |> inner_join(shp, by = "shape_id") |>
+    group_by(route_id) |> summarise(miles = median(m) * 0.000621371, .groups = "drop")
+  gtfs$routes |> select(route_id) |> inner_join(run, by = "route_id") |>
+    left_join(veh, by = "route_id") |> left_join(hw, by = "route_id") |> left_join(len, by = "route_id") |>
+    mutate(vehicles = coalesce(vehicles, 0L), speed_mph = miles / (run_sec / 3600))
+}
+```
+
+```{r table-10}
+networks <- list(
+  `Baseline`                     = "kcm_transit_april_26.zip",
+  `Baseline + Transit Priority`  = "kcm_baseline_tsp_april_26.zip",
+  `Simple 3x`                    = "kcm_triplicate_april_26.zip",
+  `Simple 3x + Transit Priority` = "kcm_triplicate_tsp_april_26.zip",
+  `Grid-Based`   = c("gtfs_grid_express.zip", "gtfs_grid_frequent.zip"),
+  `Grid + Local` = c("gtfs_grid_express_gl.zip", "gtfs_grid_standard.zip", "gtfs_grid_locals.zip"),
+  `Node-Based`   = c("gtfs_node_bus.zip", "gtfs_node_local.zip"))
+t10 <- imap_dfr(networks, function(files, nm) {
+  dirs <- ifelse(startsWith(files, "kcm_"), params$kcm_gtfs_dir, params$designed_gtfs_dir)
+  r <- map_dfr(file.path(dirs, files), route_stats)
+  tibble(`Transit Network` = nm,
+         `Peak Hour Vehicles` = format(sum(r$vehicles), big.mark = ",", trim = TRUE),
+         `Median Speed (mph)` = round(median(r$speed_mph, na.rm = TRUE), 1),
+         `Median Headway (min)` = round(median(r$headway_min, na.rm = TRUE), 1),
+         `Median Route Length (mi)` = round(median(r$miles, na.rm = TRUE), 1))
+})
+save_table(t10, "table_10_network_summary")
+```
+
+# Table 12. Trips by whether they cross the city limits (SoundCast)
+
+Seattle = census tracts that intersect the city boundary (as in Phase 1 and 2).
+
+```{r table-12}
+con <- DBI::dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+parcels <- fread(params$daysim_parcel_map, select = c("ParcelID", "Census2020Tract"))
+duckdb::duckdb_register(con, "parcels", parcels[, .(ParcelID, sea = sprintf("%011.0f", as.numeric(Census2020Tract)) %in% seattle_ids)])
+DBI::dbExecute(con, sprintf(
+  "CREATE TABLE trips AS SELECT opcl, dpcl, mode, trexpfac FROM read_csv_auto('%s', delim='\t')",
+  normalizePath(params$daysim_trips_tsv, winslash = "/")))
+buckets <- DBI::dbGetQuery(con, "
+  SELECT coalesce(o.sea, false) AS o_sea, coalesce(d.sea, false) AS d_sea, sum(t.trexpfac) AS trips
+  FROM trips t LEFT JOIN parcels o ON t.opcl = o.ParcelID LEFT JOIN parcels d ON t.dpcl = d.ParcelID
+  GROUP BY 1, 2")
+tot <- sum(buckets$trips); cell <- function(o, d) pct(buckets$trips[buckets$o_sea == o & buckets$d_sea == d] / tot)
+t12 <- tibble(`% of Trips in PSRC` = c("Starting in Seattle", "Starting outside Seattle"),
+              `Ending in Seattle` = c(cell(TRUE, TRUE), cell(FALSE, TRUE)),
+              `Ending Outside Seattle` = c(cell(TRUE, FALSE), cell(FALSE, FALSE)))
+save_table(t12, "table_12_city_limit_trips")
+```
+
+# Table 14. Seattle Vision Zero statistics, 2021-2025 (SDOT Collisions)
+
+These are also the Phase 2 Vision Zero baselines (5-year means: 29.4 fatalities,
+222.8 serious injuries).
+
+```{r table-14}
+year_sums <- map_dfr(2021:2025, function(y) {
+  r <- httr::GET(params$collisions_url, query = list(
+    where = sprintf("INCDATE >= DATE '%d-01-01' AND INCDATE < DATE '%d-01-01'", y, y + 1),
+    outStatistics = jsonlite::toJSON(list(
+      list(statisticType = "sum", onStatisticField = "SERIOUSINJURIES", outStatisticFieldName = "si"),
+      list(statisticType = "sum", onStatisticField = "FATALITIES", outStatisticFieldName = "fat")),
+      auto_unbox = TRUE),
+    f = "json"))
+  httr::stop_for_status(r)
+  a <- jsonlite::fromJSON(httr::content(r, as = "text", encoding = "UTF-8"))$features$attributes
+  tibble(year = y, serious_injuries = a$si, fatalities = a$fat)
+})
+t14 <- tibble(` ` = c("Serious injuries", "Fatalities"))
+for (i in seq_len(nrow(year_sums)))
+  t14[[as.character(year_sums$year[i])]] <- c(year_sums$serious_injuries[i], year_sums$fatalities[i])
+save_table(t14, "table_14_vision_zero_statistics")
+cat(sprintf("5-year means: %.1f fatalities, %.1f serious injuries\n",
+            mean(year_sums$fatalities), mean(year_sums$serious_injuries)))
+```
+
+# Tables 15 and 16. Mode-choice coefficients and values of travel time
+
+```{r table-15-16}
+co <- read_csv(file.path(params$phase1_dir, "coefficients.csv"), show_col_types = FALSE)
+stars <- function(p) ifelse(p < .001, "***", ifelse(p < .01, "**", ifelse(p < .05, "*", ifelse(p < .1, ".", ""))))
+t15 <- co |> transmute(Variable = variable, `β` = round(beta, 5), SE = signif(se, 3), z = round(z, 2),
+                       p = ifelse(p < .001, "< 0.001", sprintf("%.3f", p)), Sig = stars(p))
+save_table(t15, "table_15_mnl_coefficients")
+t16 <- co |> filter(!is.na(vott_usd_per_hr)) |>
+  transmute(Variable = variable, `VOTT in $ / Hour` = sprintf("$%.2f", round(vott_usd_per_hr, 1)))
+save_table(t16, "table_16_values_of_travel_time")
+```
+
+# Table 17. Basic trip characteristics by mode (baseline)
+
+Share of trips = the Phase 2 baseline (existing network, current streets) daily
+mode share; total trips = SoundCast intra-Seattle trips by mode (weighted);
+travel time and trip length = HTS intra-Seattle trips by chosen mode, the
+Phase 1 skim for that mode (drive time calibrated; transit = walk + wait +
+in-vehicle), weighted by the HTS trip weight.
+
+```{r table-17}
+ms <- p2("mode_share_daily_by_config.csv") |> filter(config_id == BASE_CFG)
+ds <- DBI::dbGetQuery(con, "
+  SELECT CASE WHEN t.mode = 1 THEN 'walk' WHEN t.mode = 2 THEN 'bike'
+              WHEN t.mode IN (3, 4, 5, 9) THEN 'drive' WHEN t.mode IN (6, 7) THEN 'transit' END AS m,
+         sum(t.trexpfac) AS trips
+  FROM trips t JOIN parcels o ON t.opcl = o.ParcelID JOIN parcels d ON t.dpcl = d.ParcelID
+  WHERE o.sea AND d.sea GROUP BY 1")
+DBI::dbDisconnect(con, shutdown = TRUE)
+tc <- readRDS(file.path(params$phase1_dir, "trips_calibrated.rds"))
+w  <- hts[, .(trip_id = as.numeric(trip_id), trip_weight)]
+tc <- tc |> inner_join(w, by = "trip_id") |>
+  mutate(tt = case_when(mode_norm == "walk" ~ walk_tt_raw, mode_norm == "bike" ~ bike_tt_raw,
+                        mode_norm == "drive" ~ drive_tt_cal, mode_norm == "transit" ~ transit_total_raw),
+         mi = case_when(mode_norm == "walk" ~ walk_dist_mi, mode_norm == "bike" ~ bike_dist_mi,
+                        mode_norm == "drive" ~ drive_dist_mi, mode_norm == "transit" ~ transit_dist_mi)) |>
+  filter(is.finite(tt), is.finite(mi), trip_weight > 0)
+wmed <- function(x, w) { o <- order(x); x[o][which(cumsum(w[o]) / sum(w) >= 0.5)[1]] }
+modes <- c(walk = "Walk", bike = "Bike", drive = "Drive", transit = "Transit")
+t17 <- map_dfr(names(modes), function(m) {
+  x <- tc |> filter(mode_norm == m)
+  tibble(Mode = modes[[m]], `% of Trips` = pct(ms[[paste0("mode_", m, "_daily")]]),
+         `Total Trips` = format(round(ds$trips[which(ds$m == m)]), big.mark = ",", trim = TRUE),
+         `Average Travel Time (min)` = round(weighted.mean(x$tt, x$trip_weight), 1),
+         `Median Travel Time (min)`  = round(wmed(x$tt, x$trip_weight), 1),
+         `Average Trip Length (miles)` = round(weighted.mean(x$mi, x$trip_weight), 1))
+})
+save_table(t17, "table_17_trip_characteristics_by_mode")
+```
+
+# Table 18. Comparison to American Community Survey commute shares
+
+PSRC = HTS commute trips (home to work or work to home) by residents of
+Seattle tracts, weighted. ACS = table B08301 (means of transportation to work),
+summed over Seattle tracts, 5-year estimates; car, truck or van, taxi and
+motorcycle count as drive, and work-from-home and "other" are left out. Both
+are shares of the four modes.
+
+```{r table-18}
+hh <- fread(params$hts_households_csv, select = c("household_id", "home_tract20"))
+hh <- unique(hh[, .(household_id, home = geoid11(home_tract20))])
+hts_c <- fread(params$hts_trips_csv, select = c("household_id", "mode_class", "trip_weight",
+                                                "origin_purpose_cat", "dest_purpose_cat"))
+commute <- hts_c[(origin_purpose_cat == "Home" & dest_purpose_cat == "Work") |
+                 (origin_purpose_cat == "Work" & dest_purpose_cat == "Home")][
+  hh[home %in% seattle_ids], on = "household_id", nomatch = 0]
+norm_mode <- function(m) case_when(str_detect(m, "Walk") ~ "walk", str_detect(m, "Bike|Micromob") ~ "bike",
+                                   str_detect(m, "Transit") ~ "transit", str_detect(m, "Drive|Hail") ~ "drive")
+psrc <- commute[, .(trips = sum(trip_weight)), by = .(m = norm_mode(mode_class))][!is.na(m)]
+psrc[, share := trips / sum(trips)]
+
+acs <- tidycensus::get_acs(geography = "tract", state = "WA", county = "King", table = "B08301",
+                           year = params$acs_year, survey = "acs5") |>
+  filter(GEOID %in% seattle_ids)
+acs_v <- list(drive = c("B08301_002", "B08301_016", "B08301_017"), transit = "B08301_010",
+              bike = "B08301_018", walk = "B08301_019")
+acs_n <- vapply(acs_v, function(v) sum(acs$estimate[acs$variable %in% v]), numeric(1))
+
+t18 <- tibble(Mode = unname(modes[c("walk", "drive", "bike", "transit")])) |>
+  mutate(m = names(modes)[match(Mode, modes)],
+         `% of PSRC Work Trips` = pct(psrc$share[match(m, psrc$m)], 0),
+         `Total Trips` = format(round(psrc$trips[match(m, psrc$m)]), big.mark = ",", trim = TRUE),
+         `ACS Mode Share` = pct(acs_n[m] / sum(acs_n), 0)) |>
+  select(-m)
+save_table(t18, "table_18_acs_comparison")
+```
+
+# Tables 19-23, 26-28. Results by configuration
+
+```{r tables-19-28}
+tt <- p2("transit_tt_stats_by_config_tod.csv") |> filter(tod == "AM")
+save_table(grid_table(setNames(sprintf("%.1f", tt$median_min), tt$config_id),
+                      c("no_pri_no_av", "no_pri_av", "pri_no_av")),
+           "table_19_transit_travel_time_am_median")
+
+save_table(grid_table(setNames(sprintf("%.1f%%", summ$walkshed_pct_seattle_frequent), summ$config_id),
+                      c("no_pri_no_av", "no_pri_av", "pri_no_av")),
+           "table_20_walkshed_frequent_transit")
+
+acc <- p2("accessibility_aggregate_wide.csv")
+b   <- acc |> filter(config_id == BASE_CFG)
+t21 <- acc |> filter(config_id != BASE_CFG) |>
+  mutate(network = NETWORKS[sub("__.*", "", config_id)],
+         street  = STREETS[sub(".*__", "", config_id)]) |>
+  transmute(`Street Network` = street, `Transit Network` = network,
+            `Car Jobs (k)` = round(acc_drive_30min / 1000),
+            `Transit Jobs (k)` = round(acc_transit_30min / 1000),
+            `Car % Change` = sgn(100 * (acc_drive_30min / b$acc_drive_30min - 1)),
+            `Transit % Change` = sprintf("%.2f%%", 100 * (acc_transit_30min / b$acc_transit_30min - 1))) |>
+  arrange(match(`Street Network`, STREETS), match(`Transit Network`, NETWORKS))
+t21 <- bind_rows(tibble(`Street Network` = "Reference", `Transit Network` = "Baseline",
+                        `Car Jobs (k)` = round(b$acc_drive_30min / 1000),
+                        `Transit Jobs (k)` = round(b$acc_transit_30min / 1000),
+                        `Car % Change` = "---", `Transit % Change` = "---"), t21)
+save_table(t21, "table_21_employment_accessibility")
+
+B <- summ |> filter(config_id == BASE_CFG)
+others <- summ |> filter(config_id != BASE_CFG)
+save_table(grid_table(setNames(sprintf("%s / %s",
+    sgn(100 * (others$mode_drive_daily - B$mode_drive_daily), 1, "pp"),
+    sgn(100 * (others$mode_transit_daily - B$mode_transit_daily), 1, "pp")), others$config_id)),
+  "table_22_mode_share_change")
+
+save_table(grid_table(setNames(sprintf("%.1f mph / %.1f%%", summ$avg_speed_modeled,
+                                       summ$pct_vmt_on_overcap_daily), summ$config_id)),
+           "table_23_speed_and_overcapacity")
+
+save_table(grid_table(setNames(sprintf("%.3f", others$spearman_rho), others$config_id)),
+           "table_26_accessibility_rse_correlation")
+
+save_table(grid_table(setNames(sgn(100 * (others$daily_vmt_total / B$daily_vmt_total - 1)),
+                               others$config_id)),
+           "table_27_daily_vmt_change")
+
+save_table(grid_table(setNames(sprintf("%s / %s",
+    sgn(100 * (others$projected_fatalities / B$projected_fatalities - 1)),
+    sgn(100 * (others$projected_serious_injuries / B$projected_serious_injuries - 1))), others$config_id)),
+  "table_28_fatalities_serious_injuries")
+```
+
+# Table 24. Output metrics for two models at AM peak (sensitivity base point)
+
+```{r table-24}
+sm <- read_csv(file.path(params$sens_dir, "sensitivity_metrics.csv"), show_col_types = FALSE) |>
+  filter(tag == "base") |> arrange(role)
+f <- function(r) sm[sm$role == r, ]
+t24 <- tibble(
+  Metric = c("Drive mode share", "Transit mode share", "Network-avg speed (mph)",
+             "Transit jobs reachable / 30 min", "Drive jobs reachable / 30 min",
+             "Projected fatalities / yr"),
+  `Baseline Networks` = c(pct(f("baseline")$drive), pct(f("baseline")$transit),
+                          sprintf("%.1f", f("baseline")$avg_speed_mph),
+                          format(round(f("baseline")$jobs_30min_transit), big.mark = ",", trim = TRUE),
+                          format(round(f("baseline")$jobs_30min_drive), big.mark = ",", trim = TRUE),
+                          sprintf("%.1f", f("baseline")$fatalities)),
+  `Grid + Local and AV-Induced Traffic` = c(pct(f("treatment")$drive), pct(f("treatment")$transit),
+                          sprintf("%.1f", f("treatment")$avg_speed_mph),
+                          format(round(f("treatment")$jobs_30min_transit), big.mark = ",", trim = TRUE),
+                          format(round(f("treatment")$jobs_30min_drive), big.mark = ",", trim = TRUE),
+                          sprintf("%.1f (%+.0f%%)", f("treatment")$fatalities,
+                                  100 * (f("treatment")$fatalities / f("baseline")$fatalities - 1))))
+save_table(t24, "table_24_sensitivity_base_point")
+```
+
+# Table 29. Projections by time of day, Grid + Local with AV-induced traffic
+
+```{r table-29}
+vz <- p2("vision_zero_by_config_tod.csv") |> filter(config_id == "grid_local__pri_av") |>
+  mutate(tod = factor(tod, c("AM", "Midday", "PM", "Evening", "Night"))) |> arrange(tod)
+t29 <- vz |> transmute(
+  `Time of Day` = recode(as.character(tod), AM = "AM peak", PM = "PM peak"),
+  `Speed Change` = sgn(100 * (speed_ratio - 1)),
+  `VMT Ratio` = sprintf("%.3f", vmt_ratio),
+  `Fatalities (baseline)` = sprintf("%.2f", fatal_baseline_t),
+  `Fatalities (projected)` = sprintf("%.2f", fatal_t),
+  `Serious Injuries (baseline)` = sprintf("%.1f", si_baseline_t),
+  `Serious Injuries (projected)` = sprintf("%.1f", si_t))
+save_table(t29, "table_29_vision_zero_by_tod")
+```

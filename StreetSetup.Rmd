@@ -1,0 +1,1334 @@
+---
+title: "Street setup: drive graph, lane counts and SDOT ↔ OSM way-id repair"
+author: "Stephen Siciliano"
+output: html_document
+params:
+  # ---- inputs ----
+  osm_pbf:                    "data/public/osm/washington-260122.osm.pbf"
+  lanes_geojson:              "data/public/sdot/traffic_lanes.geojson"
+  streets_geojson:            "data/public/sdot/seattle_streets.geojson"   # SDOT Seattle Streets (downloaded on first use)
+  proposed_bus_lanes_geojson: "data/own/proposed_bus_lanes.geojson"
+  snd_csv:                    "data/own/sdot_snd_osm_crosswalk.csv"
+  corridors_csv:              "data/own/osm_snd_corridors.csv"
+  # ---- outputs (outputs/streets/) ----
+  streetnet_rds:              "outputs/streets/osm_streetnet.rds"     # driveable OSM ways, PSRC 4-county clip
+  graph_rds:                  "outputs/streets/drive_graph.rds"       # routable dodgr graph
+  street_grid_geojson:        "outputs/streets/street_grid.geojson"   # every Seattle street segment, all properties
+  repair_csv:                 "outputs/streets/way_id_repair.csv"     # corridor-level fixes to the crosswalk
+  # ---- Part 1: drive graph ----
+  psrc_counties:  !r c("King", "Pierce", "Snohomish", "Kitsap")
+  tigris_year:    2020
+  wt_profile:     "motorcar"
+  force_rebuild_streetnet: false
+  force_rebuild_graph:     true
+  # Sanity-check OSM way IDs that *must* be present (Magnolia's three bridges)
+  smoke_test_way_ids: !r c("43032658", "22758987", "43314745")
+  # ---- Part 3: way-id repair ----
+  # Spatial parameters. Both sides are pre-filtered by name/ref to a single
+  # corridor, so we can afford to be generous — a sample point on a long OSM
+  # way will still find the right COMPKEY even if the nearest COMPKEY's
+  # centroid is far away (because SND is much more subdivided).
+  sample_spacing_m:     25
+  # Maximum distance from an OSM sample point to its nearest in-corridor
+  # COMPKEY. Acts as a safety net so a single stray OSM way that happens to
+  # share a name but is geometrically off-corridor doesn't get attached.
+  max_sample_dist_m:    300
+  # Fallback maximum distance, applied only to OSM ways that produced ZERO
+  # hits at the strict threshold above. The corridor name/ref filter has
+  # already constrained the universe to the right road, so we accept
+  # nearest snaps from much farther away rather than silently dropping the
+  # way. Catches the SR-99 Tunnel (OSM follows the underground alignment,
+  # SDOT draws street-level) and the Ship Canal Bridge (elevated alignment
+  # vs surface footprint).
+  max_sample_dist_fallback_m: 2000
+  # CRS for planar geometry (UTM 10N covers PSRC).
+  planar_crs:           32610
+  # Default for cases where OSM oneway tag is missing/blank — treat as
+  # two-way (matches OSM convention).
+  default_oneway:       "no"
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = FALSE)
+
+suppressPackageStartupMessages({
+  library(sf)
+  library(tigris)
+  library(osmextract)
+  library(dodgr)
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(stringr)
+  library(purrr)
+  library(httr)
+  library(jsonlite)
+  library(readr)
+})
+
+options(tigris_use_cache = TRUE)
+dir.create("outputs/streets", showWarnings = FALSE, recursive = TRUE)
+```
+
+Builds everything later stages need to know about the street network, written
+to `outputs/streets/`:
+
+1. **Drive graph** (`osm_streetnet.rds`, `drive_graph.rds`) — the OpenStreetMap
+   Washington extract clipped to the four PSRC counties, as an `sf` layer of
+   driveable ways and as a routable `dodgr` graph. Every edge carries its OSM way
+   id, which links road edges to SDOT street segments, traffic counts and lanes.
+2. **Street grid** (`street_grid.geojson`) — every Seattle street segment (SDOT
+   Seattle Streets) with its properties: current through-lane counts per
+   direction, the lane counts after the proposed bus lanes, lane widths, and
+   arterial / divided-carriageway / freeway-ramp flags.
+3. **Way-id repair** (`way_id_repair.csv`) — corrected SDOT ↔ OSM way-id links
+   on key corridors where the crosswalk (`data/own/sdot_snd_osm_crosswalk.csv`)
+   is wrong or needs a many-to-many mapping per direction. Phase 2 overlays it on
+   the crosswalk.
+
+# Part 1 — Drive graph from OpenStreetMap
+
+## 1. PSRC 4-county clip polygon
+
+```{r psrc-polygon}
+counties_wa <- tigris::counties(state = "WA",
+                                year  = params$tigris_year,
+                                class = "sf") |>
+  sf::st_transform(4326) |>
+  sf::st_make_valid()
+
+psrc_sf <- counties_wa |>
+  dplyr::filter(NAME %in% params$psrc_counties)
+
+stopifnot(nrow(psrc_sf) == length(params$psrc_counties))
+cat("PSRC counties loaded:", paste(sort(psrc_sf$NAME), collapse = ", "), "\n")
+
+psrc_union <- sf::st_union(psrc_sf)
+psrc_bbox  <- sf::st_bbox(psrc_union)
+print(psrc_bbox)
+```
+
+## 2. Read & clip the PBF
+
+We use `osmextract::oe_read` with a bbox spatial filter (`-spat`, much more
+reliable across GDAL builds than `-clipsrc` polygon clipping), then
+filter to driveable highway classes and clip to the exact PSRC polygon
+in R afterward. We request the OSM tags `weight_streetnet` and downstream
+code need (`lanes`, `maxspeed`, `oneway`, `bridge`, `tunnel`, `junction`,
+`access`, `ref`) via `extra_tags` so they survive into the dodgr graph.
+
+```{r read-pbf}
+stopifnot(file.exists(params$osm_pbf))
+
+drive_classes <- c(
+  "motorway", "motorway_link", "trunk", "trunk_link",
+  "primary",  "primary_link",  "secondary", "secondary_link",
+  "tertiary", "tertiary_link", "unclassified",
+  "residential", "living_street", "service"
+)
+
+if (!file.exists(params$streetnet_rds) ||
+    isTRUE(params$force_rebuild_streetnet)) {
+
+  # osmextract writes a .gpkg conversion next to the .osm.pbf it reads. Read a
+  # hard link inside the cache so that file lands in cache/, not in data/.
+  pbf_link <- file.path("cache", "osm", basename(params$osm_pbf))
+  if (!file.exists(pbf_link) || file.info(pbf_link)$size != file.info(params$osm_pbf)$size) {
+    dir.create(dirname(pbf_link), showWarnings = FALSE, recursive = TRUE)
+    unlink(pbf_link)
+    if (!isTRUE(file.link(params$osm_pbf, pbf_link))) file.copy(params$osm_pbf, pbf_link)
+  }
+  message("Reading PBF — first run will be slow (osmextract converts it to a ",
+          ".gpkg in cache/osm/; subsequent reads are fast).")
+
+  # PSRC bbox as an sfc polygon — used as a -spat filter (bbox, not polygon
+  # clip). This widens slightly past the four counties at the corners but
+  # we trim with an exact polygon intersect after the read.
+  psrc_bbox_sfc <- sf::st_as_sfc(psrc_bbox, crs = 4326)
+
+  t0 <- Sys.time()
+  streetnet <- osmextract::oe_read(
+    file_path     = normalizePath(pbf_link, winslash = "/"),
+    layer         = "lines",
+    boundary      = psrc_bbox_sfc,
+    boundary_type = "spat",
+    extra_tags    = c("lanes", "maxspeed", "oneway", "bridge", "tunnel",
+                      "junction", "access", "ref", "service"),
+    quiet         = FALSE
+  )
+  cat(sprintf("Read %d LineStrings (bbox filter) in %.1fs\n",
+              nrow(streetnet),
+              as.numeric(Sys.time() - t0, units = "secs")))
+
+  # Filter to driveable highway tags. (`oe_read` returns rows with NA
+  # `highway` for non-road lines like waterways, paths, etc.)
+  streetnet <- streetnet |>
+    dplyr::filter(highway %in% drive_classes)
+  cat("After highway filter:", nrow(streetnet), "features\n")
+
+  # Trim to the exact PSRC 4-county polygon. `st_filter` with the default
+  # `st_intersects` predicate keeps any LineString that touches PSRC; this
+  # is what we want (a highway crossing the boundary stays in).
+  t0 <- Sys.time()
+  streetnet <- sf::st_filter(streetnet, psrc_union,
+                             .predicate = sf::st_intersects)
+  cat(sprintf("After PSRC polygon intersect: %d features (%.1fs)\n",
+              nrow(streetnet),
+              as.numeric(Sys.time() - t0, units = "secs")))
+
+  saveRDS(streetnet, params$streetnet_rds)
+  message("Saved streetnet cache: ", normalizePath(params$streetnet_rds))
+} else {
+  streetnet <- readRDS(params$streetnet_rds)
+  cat("Loaded cached streetnet:", nrow(streetnet), "features\n")
+}
+
+# osm_id is always populated by osmextract; double-check anyway.
+n_missing <- sum(is.na(streetnet$osm_id))
+cat(sprintf("Features with NA osm_id: %d (%.4f%%)\n",
+            n_missing, 100 * mean(is.na(streetnet$osm_id))))
+if (n_missing > 0) {
+  stop("Some features lack osm_id — weight_streetnet would assign NA way_id.")
+}
+
+cat("Highway-class breakdown:\n")
+hwy_counts <- streetnet |>
+  sf::st_drop_geometry() |>
+  dplyr::count(highway, sort = TRUE) |>
+  as.data.frame()
+print(hwy_counts, row.names = FALSE)
+```
+
+## 3. Build the dodgr graph
+
+```{r build-graph}
+if (!file.exists(params$graph_rds) || isTRUE(params$force_rebuild_graph)) {
+
+  message("Weighting streetnet for ", params$wt_profile, " ...")
+  t0 <- Sys.time()
+  graph <- dodgr::weight_streetnet(
+    x          = streetnet,
+    wt_profile = params$wt_profile,
+    id_col     = "osm_id",
+    # `oneway` is consumed by weight_streetnet to decide whether to create
+    # a reverse edge, but we keep it as an explicit column too — downstream
+    # capacity / SND-mapping logic uses it as a fallback when the SND
+    # ONEWAY flag is missing or contradicts the OSM tag.
+    keep_cols  = c("bridge", "tunnel", "ref", "name", "maxspeed", "lanes",
+                   "oneway")
+  )
+  cat(sprintf("Weighted in %.1fs — edges: %d\n",
+              as.numeric(Sys.time() - t0, units = "secs"),
+              nrow(graph)))
+
+  # Critical invariant: every edge carries the OSM way ID it came from.
+  na_way <- sum(is.na(graph$way_id))
+  cat(sprintf("Edges with NA way_id (post-weight): %d (%.4f%%)\n",
+              na_way, 100 * mean(is.na(graph$way_id))))
+  if (na_way > 0) {
+    stop("weight_streetnet produced edges without way_id — abort. ",
+         "Inspect head(graph[is.na(graph$way_id), ]) to see which.")
+  }
+
+  # Largest connected component (matches behavior of original cache).
+  message("Filtering to component == 1 ...")
+  graph <- graph[!is.na(graph$component) & graph$component == 1, ]
+  cat("After component=1 filter:", nrow(graph), "edges\n")
+  cat("Distinct OSM way_ids in graph:",
+      length(unique(graph$way_id)), "\n")
+
+  saveRDS(graph, params$graph_rds)
+  message("Saved: ", normalizePath(params$graph_rds))
+} else {
+  graph <- readRDS(params$graph_rds)
+  cat("Loaded cached graph:", nrow(graph), "edges\n")
+}
+```
+
+## 4. Smoke test — verify the Magnolia bridges are present by way_id
+
+```{r smoke-test}
+hits <- tibble::tibble(
+  way_id = params$smoke_test_way_ids,
+  n_edges_in_graph = vapply(params$smoke_test_way_ids, function(b) {
+    sum(as.character(graph$way_id) == b, na.rm = TRUE)
+  }, integer(1))
+)
+print(hits)
+
+if (any(hits$n_edges_in_graph == 0)) {
+  warning("Some smoke-test OSM ways are missing from the graph. ",
+          "Check that the PSRC clip polygon covers the bridge location, ",
+          "and that the bridge's highway class is in `drive_classes`.")
+} else {
+  cat("All smoke-test bridges found in graph ✓\n")
+}
+
+# Spot-check geometry: print one edge per bridge and its midpoint.
+for (b in params$smoke_test_way_ids) {
+  rows <- which(as.character(graph$way_id) == b)
+  if (length(rows) == 0) next
+  r <- rows[1]
+  cat(sprintf(
+    "  way_id %s: %d edges | sample edge midpoint (%.5f, %.5f) | highway=%s\n",
+    b, length(rows),
+    (graph$from_lat[r] + graph$to_lat[r]) / 2,
+    (graph$from_lon[r] + graph$to_lon[r]) / 2,
+    graph$highway[r]))
+}
+```
+
+# Part 2 — Lane counts, current and with bus lanes
+
+Build a per-segment table of through-lane counts for every Seattle street
+segment, with a "new" count for the subset of segments slated for bus lanes.
+
+Inputs:
+
+* **Seattle Streets** — ArcGIS REST FeatureServer, downloaded fresh:
+  https://services.arcgis.com/ZOyb2t4B0UYuYNYH/arcgis/rest/services/Seattle_Streets_1/FeatureServer/0
+  Used as the spatial base. Joins via `COMPKEY` (= `SEGKEY` in the lanes data)
+  and `SEGDIR`.
+* `data/public/sdot/traffic_lanes.geojson` — one feature per individual lane,
+  often split mid-block. Fields: `SEGKEY`, `LANEKEY`, `TRAFFDIR`, `LANETYPE`,
+  `DISTANCE`, `ENDDISTANC`, `OPERENDDAT`.
+* `data/own/proposed_bus_lanes.geojson` — proposed bus-lane segments
+  (one row per block-segment getting a *pair* of bus lanes). The only fields
+  pulled in are `LaneWidthsSummary.csv.MinWidth` (-> `MinWidth`),
+  `LaneWidthsSummary.csv.WidthOpptyMin` (-> `MinOppty`), and
+  `LaneWidthsSummary.csv.WidthOpptyMax` (-> `MaxOppty`).
+
+Output:
+
+* `outputs/streets/street_grid.geojson` — every Seattle street segment, with current
+  per-direction through-lane counts (`SAMELANECOUNT` aligned to `SEGDIR`,
+  `OPSLANECOUNT` opposing); `MinWidth`/`MinOppty`/`MaxOppty` where available;
+  and `NEW_SAMELANECOUNT` / `NEW_OPSLANECOUNT` for segments with a proposed
+  bus lane (NA otherwise).
+
+```{r lane-constants}
+# SND_SEGMENT_TYPE code for freeway ramps. Bus-lane proposals overlapping
+# a ramp COMPKEY are forced back to current lane counts (no capacity change).
+RAMP_SEGMENT_TYPE <- 4L
+
+STREETS_URL <- "https://services.arcgis.com/ZOyb2t4B0UYuYNYH/arcgis/rest/services/Seattle_Streets_1/FeatureServer/0/query"
+```
+
+
+
+## 1. Download Seattle Streets (paginated)
+
+The FeatureServer caps response size, so we page with `resultOffset` until the
+server tells us there's nothing more. Cached to disk so re-knits are fast;
+delete `data/public/sdot/seattle_streets.geojson` to force a refresh.
+
+```{r download-streets}
+fetch_streets <- function(url, page_size = 2000) {
+  out <- list()
+  offset <- 0
+  repeat {
+    q <- list(
+      where = "1=1",
+      outFields = "*",
+      f = "geojson",
+      outSR = 4326,
+      resultOffset = offset,
+      resultRecordCount = page_size
+    )
+    r <- httr::GET(url, query = q, httr::timeout(120))
+    httr::stop_for_status(r)
+    txt <- httr::content(r, as = "text", encoding = "UTF-8")
+
+    # Read this page as sf
+    page <- sf::st_read(txt, quiet = TRUE)
+    if (nrow(page) == 0) break
+    out[[length(out) + 1]] <- page
+
+    # Some servers signal more via exceededTransferLimit at the JSON root.
+    j <- jsonlite::fromJSON(txt, simplifyVector = FALSE)
+    more <- isTRUE(j$exceededTransferLimit) ||
+            isTRUE(j$properties$exceededTransferLimit)
+    if (!more && nrow(page) < page_size) break
+    offset <- offset + nrow(page)
+    cat("  fetched", offset, "features\n")
+  }
+  do.call(rbind, out)
+}
+
+if (!file.exists(params$streets_geojson)) {
+  message("Downloading Seattle Streets...")
+  streets_dl <- fetch_streets(STREETS_URL)
+  dir.create(dirname(params$streets_geojson), recursive = TRUE, showWarnings = FALSE)
+  if (file.exists(params$streets_geojson)) file.remove(params$streets_geojson)
+  st_write(streets_dl, params$streets_geojson, driver = "GeoJSON", quiet = TRUE)
+}
+
+streets <- st_read(params$streets_geojson, quiet = TRUE)
+cat("Seattle Streets:", nrow(streets), "features\n")
+cat("columns:", paste(names(streets), collapse = ", "), "\n")
+```
+
+## 2. Load + filter the lane inventory
+
+Drop lanes with a non-null `OPERENDDAT` (decommissioned). `TRAFFDIR == "C"` is
+the bidirectional center turn lane and is excluded from directional counting.
+
+```{r load-lanes}
+lanes <- st_read(params$lanes_geojson, quiet = TRUE) %>%
+  st_drop_geometry() %>%
+  filter(is.na(OPERENDDAT) | OPERENDDAT == "") %>%
+  filter(!is.na(SEGKEY), !is.na(TRAFFDIR), !is.na(LANETYPE)) %>%
+  filter(TRAFFDIR != "C")
+
+cat("kept", nrow(lanes), "active directional lane features\n")
+```
+
+## 3. Through-lane counter
+
+* `T1..T5` are parallel through lanes — count distinct T-numbers.
+* `TRT` / `TLT` substitute for `T1`.
+* Everything else (turn-only, BUS*, HOV, parking, etc.) doesn't add capacity.
+
+```{r count-fn}
+THROUGH_TYPES <- c("T1", "T2", "T3", "T4", "T5")
+
+# TRT (Through-Right Turn) and TLT (Through-Left Turn) are physical
+# through-lanes that also permit turns at the next intersection — count
+# them as the equivalent of T1.
+#
+# TSHRW is a through-lane with a sharrow (bike-share marking). The lane
+# still operates as a regular travel lane for cars; the sharrow is paint,
+# not lane geometry. Wallingford Ave N and several other "sharrowed
+# arterials" are 0/0 in the inventory under the old logic because their
+# only travel lanes are marked TSHRW. Treat them as T1.
+TRAVEL_ALIASES <- c("TRT", "TLT", "TSHRW")
+
+count_through <- function(lanetype) {
+  lt <- ifelse(lanetype %in% TRAVEL_ALIASES, "T1", lanetype)
+  lt <- lt[lt %in% THROUGH_TYPES]
+  length(unique(lt))
+}
+```
+
+## 4. Per-(SEGKEY, TRAFFDIR) start / end counts
+
+For each (SEGKEY, TRAFFDIR):
+
+* **start** = lanes at the minimum `DISTANCE` value present.
+* **end**   = lanes at the maximum `ENDDISTANC` value present.
+
+Reported lane count = `min(start, end)` (bottleneck), with both kept for
+inspection.
+
+```{r start-end-counts}
+seg_dir_counts <- lanes %>%
+  group_by(SEGKEY, TRAFFDIR) %>%
+  summarise(
+    .groups = "drop",
+    min_dist = min(DISTANCE, na.rm = TRUE),
+    max_end  = max(ENDDISTANC, na.rm = TRUE),
+    start_lanes = count_through(LANETYPE[DISTANCE  == min_dist[1]]),
+    end_lanes   = count_through(LANETYPE[ENDDISTANC == max_end[1]])
+  ) %>%
+  mutate(lane_count = pmin(start_lanes, end_lanes)) %>%
+  select(SEGKEY, TRAFFDIR, lane_count, start_lanes, end_lanes)
+
+head(seg_dir_counts)
+```
+
+## 5. Direction helper + join lane counts onto streets
+
+```{r dir-helper}
+opposite_dir <- function(d) {
+  d <- toupper(d)
+  recode(d,
+    "N"  = "S",  "S"  = "N",
+    "E"  = "W",  "W"  = "E",
+    "NE" = "SW", "SW" = "NE",
+    "NW" = "SE", "SE" = "NW",
+    .default = NA_character_
+  )
+}
+```
+
+Seattle Streets exposes the segment id as `COMPKEY` and the orientation as
+`SEGDIR`. We treat `SEGDIR` as the SAME side and its opposite as OPS.
+
+```{r join-counts}
+streets <- streets %>%
+  mutate(
+    COMPKEY = as.integer(COMPKEY),
+    SEGDIR = toupper(trimws(as.character(SEGDIR))),
+    OPPDIR = opposite_dir(SEGDIR)
+  )
+
+same_join <- seg_dir_counts %>%
+  rename(TRAFFDIR_SAME = TRAFFDIR,
+         SAMELANECOUNT_ARTERIAL = lane_count,
+         SAME_START = start_lanes,
+         SAME_END   = end_lanes)
+
+ops_join <- seg_dir_counts %>%
+  rename(TRAFFDIR_OPS = TRAFFDIR,
+         OPSLANECOUNT_ARTERIAL = lane_count,
+         OPS_START = start_lanes,
+         OPS_END   = end_lanes)
+
+streets_joined <- streets %>%
+  left_join(same_join, by = c("COMPKEY" = "SEGKEY", "SEGDIR" = "TRAFFDIR_SAME")) %>%
+  left_join(ops_join,  by = c("COMPKEY" = "SEGKEY", "OPPDIR" = "TRAFFDIR_OPS"))
+```
+
+## 6. Apply residential defaults for current counts
+
+A segment is treated as non-arterial / residential when neither direction is
+present in the lane inventory. Default to 1 lane each direction.
+
+> **TODO / caveat:** we cannot detect residential one-way streets from this
+> data alone — those should be 1/0 not 1/1. Splice in a one-way flag here if
+> one becomes available.
+
+```{r residential-defaults}
+# Freeway-class COMPKEYs (I-5, I-90, SR-99 mainline, SR-520) are WSDOT-
+# maintained and not in SDOT's lane inventory, so `is_arterial=FALSE` for
+# them — but the residential default of 1+1 lanes is obviously wrong. We
+# emit NA instead; the downstream consumer (`safe_current` in
+# Phase2RunSimulation §5)
+# treats NA as a fallback trigger and picks up the OSM `lanes` tag, which
+# is correct per-direction for the OSM-tagged-oneway freeway features.
+FREEWAY_ARTDESCRIPTS <- c("Interstate/Freeway", "State Route/Freeway")
+
+streets_joined <- streets_joined %>%
+  mutate(
+    is_arterial = !is.na(SAMELANECOUNT_ARTERIAL) | !is.na(OPSLANECOUNT_ARTERIAL),
+    is_freeway_class_no_data = !is_arterial &
+                               as.character(ARTDESCRIPT) %in% FREEWAY_ARTDESCRIPTS,
+    SAMELANECOUNT = case_when(
+      is_arterial               ~ coalesce(SAMELANECOUNT_ARTERIAL, 0L),
+      is_freeway_class_no_data  ~ NA_integer_,
+      TRUE                      ~ 1L),
+    OPSLANECOUNT = case_when(
+      is_arterial               ~ coalesce(OPSLANECOUNT_ARTERIAL,  0L),
+      is_freeway_class_no_data  ~ NA_integer_,
+      TRUE                      ~ 1L)
+  )
+
+cat("COMPKEYs with freeway-class but no SDOT lane data (using OSM fallback):",
+    sum(streets_joined$is_freeway_class_no_data, na.rm = TRUE), "\n")
+
+# ---- Baseline sanity floor ----
+# 2-way roads physically must have ≥ 1 through-lane in each direction;
+# 1-way roads must have ≥ 1 in the flow direction. SDOT's inventory
+# under-counts in two known cases — sharrow-only blocks (the TSHRW
+# category, which the original code didn't recognise) and arterial
+# segments where every lane is marked turn-only — both of which produce
+# SAMELANECOUNT=0 and/or OPSLANECOUNT=0 for streets that obviously have
+# through traffic. The floor here corrects those without touching:
+#   * residential streets (already get the 1/1 default above);
+#   * freeway-no-data (stays NA, OSM-fallback handles it);
+#   * legitimate 1-way streets (only the flow-aligned direction gets
+#     floored, the reverse direction correctly stays 0).
+streets_joined <- streets_joined %>%
+  mutate(
+    .is_one_way_road   = toupper(trimws(as.character(ONEWAY))) == "Y",
+    .flow_dir          = toupper(trimws(as.character(ONEWAYDIR))),
+    .seg_dir           = toupper(trimws(as.character(SEGDIR))),
+    .same_is_flow_side = .is_one_way_road & .flow_dir == .seg_dir &
+                         nzchar(.flow_dir),
+    .ops_is_flow_side  = .is_one_way_road & .flow_dir != .seg_dir &
+                         nzchar(.flow_dir),
+    # Compute the floor (integer scalar broadcast) and pmax against current.
+    # Both inputs to pmax are guaranteed integer vectors of the same length,
+    # so no type-inference oddities can turn the column into a list.
+    .same_floor = dplyr::case_when(
+      !.is_one_way_road                  ~ 1L,
+      .same_is_flow_side                 ~ 1L,
+      TRUE                               ~ 0L),
+    .ops_floor = dplyr::case_when(
+      !.is_one_way_road                  ~ 1L,
+      .ops_is_flow_side                  ~ 1L,
+      TRUE                               ~ 0L),
+    # NA propagates: pmax(NA, x) is NA, so freeway-no-data stays NA.
+    SAMELANECOUNT = pmax(as.integer(SAMELANECOUNT), .same_floor),
+    OPSLANECOUNT  = pmax(as.integer(OPSLANECOUNT),  .ops_floor)
+  ) %>%
+  dplyr::select(-.is_one_way_road, -.flow_dir, -.seg_dir,
+                -.same_is_flow_side, -.ops_is_flow_side,
+                -.same_floor, -.ops_floor)
+
+cat(sprintf("After baseline sanity floor: %d COMPKEYs with SAMELANECOUNT>=1, %d with OPSLANECOUNT>=1\n",
+            sum(streets_joined$SAMELANECOUNT >= 1L, na.rm = TRUE),
+            sum(streets_joined$OPSLANECOUNT >= 1L, na.rm = TRUE)))
+```
+
+## 6b. Detect divided-road carriageways
+
+A divided arterial (Beacon Ave S, I-5, etc.) is encoded in SND as **two
+adjacent one-way COMPKEYs** going opposite directions. A proposed bus
+lane on such a corridor takes **one** lane from each carriageway — not a
+pair. The `new_through()` function below otherwise assumes every proposed
+bus lane is a pair (10.5 ft + 10.5 ft = 21 ft), which double-penalises
+divided corridors (4 lanes removed where 2 is correct).
+
+We flag a COMPKEY as `is_divided_carriageway` when it's `ONEWAY = Y` and
+there's another `ONEWAY = Y` COMPKEY within `PAIR_BUFFER_M` going the
+opposite `ONEWAYDIR`. Standalone one-way streets (downtown 1st/2nd Ave)
+have no paired carriageway nearby and keep the pair-of-bus-lanes
+treatment — those streets are proposed to be converted to two-way for the
+bus lanes, so the pair logic matches the intent.
+
+```{r divided-detection}
+PAIR_BUFFER_M <- 50
+
+oneways <- streets %>%
+  filter(toupper(trimws(as.character(ONEWAY))) == "Y") %>%
+  mutate(.dir_norm = toupper(trimws(as.character(ONEWAYDIR)))) %>%
+  filter(.dir_norm %in% c("N","S","E","W","NE","NW","SE","SW"))
+
+cat("One-way COMPKEYs:", nrow(oneways), "\n")
+
+if (nrow(oneways) > 0) {
+  # Project to a planar CRS (WA State Plane North or UTM 10N) so the
+  # within-distance check is in metres rather than degrees.
+  oneways_p <- sf::st_transform(oneways, 32610)
+  nearby <- sf::st_is_within_distance(oneways_p, oneways_p,
+                                      dist = PAIR_BUFFER_M)
+
+  is_divided <- vapply(seq_len(nrow(oneways_p)), function(i) {
+    this_dir <- oneways_p$.dir_norm[i]
+    opp <- opposite_dir(this_dir)
+    others <- setdiff(nearby[[i]], i)
+    if (!length(others)) return(FALSE)
+    any(oneways_p$.dir_norm[others] == opp, na.rm = TRUE)
+  }, logical(1))
+
+  divided_compkeys <- oneways_p$COMPKEY[is_divided]
+  cat("Divided-road carriageway COMPKEYs:", length(divided_compkeys), "\n")
+} else {
+  divided_compkeys <- integer(0)
+}
+
+streets_joined <- streets_joined %>%
+  mutate(is_divided_carriageway = COMPKEY %in% divided_compkeys)
+```
+
+## 6c. Detect freeway ramps
+
+Bus-lane proposals don't apply to on/off ramps — they're short, geometrically
+constrained, and lane configuration is dictated by the upstream/downstream
+mainline. Flag ramps so `NEW_SAMELANECOUNT` / `NEW_OPSLANECOUNT` get forced
+back to the current values (no capacity change).
+
+Detection uses `SND_SEGMENT_TYPE = 4` (SDOT's authoritative ramp code) by
+COMPKEY. The SND CSV has one row per `(COMPKEY, SND_ID, TRAFFICDIR)`;
+`SND_SEGMENT_TYPE` is constant per COMPKEY so we just take the first
+non-NA value per COMPKEY.
+
+```{r ramp-detection}
+snd_seg_type_by_compkey <- readr::read_csv(
+    params$snd_csv,
+    col_select = c("COMPKEY", "SND_SEGMENT_TYPE"),
+    col_types  = readr::cols(.default = readr::col_character()),
+    progress   = FALSE) %>%
+  mutate(COMPKEY = suppressWarnings(as.integer(COMPKEY)),
+         SND_SEGMENT_TYPE = suppressWarnings(as.integer(SND_SEGMENT_TYPE))) %>%
+  filter(!is.na(COMPKEY)) %>%
+  group_by(COMPKEY) %>%
+  summarise(SND_SEGMENT_TYPE = {
+              v <- SND_SEGMENT_TYPE[!is.na(SND_SEGMENT_TYPE)]
+              if (length(v)) v[1] else NA_integer_
+            },
+            .groups = "drop")
+
+streets_joined <- streets_joined %>%
+  left_join(snd_seg_type_by_compkey, by = "COMPKEY") %>%
+  mutate(is_freeway_ramp = !is.na(SND_SEGMENT_TYPE) &
+                           SND_SEGMENT_TYPE == RAMP_SEGMENT_TYPE)
+
+cat("Freeway ramp COMPKEYs flagged:",
+    sum(streets_joined$is_freeway_ramp, na.rm = TRUE), "\n")
+```
+
+## 7. Pull MinWidth / MinOppty / MaxOppty from the proposed bus lanes
+
+Most Seattle Streets segments aren't in this file; they get NA.
+
+```{r transit-widths}
+transit <- st_read(params$proposed_bus_lanes_geojson, quiet = TRUE) %>% st_drop_geometry()
+
+seg_col      <- grep("COMPKEY",      names(transit), value = TRUE)[1]
+minw_col     <- grep("MinWidth",     names(transit), value = TRUE)[1]
+minopp_col   <- grep("WidthOpptyMin", names(transit), value = TRUE)[1]
+maxopp_col   <- grep("WidthOpptyMax", names(transit), value = TRUE)[1]
+stopifnot(!is.na(seg_col), !is.na(minw_col), !is.na(minopp_col), !is.na(maxopp_col))
+
+transit_widths <- transit %>%
+  transmute(
+    COMPKEY  = as.integer(.data[[seg_col]]),
+    MinWidth = as.numeric(.data[[minw_col]]),
+    MinOppty = as.numeric(.data[[minopp_col]]),
+    MaxOppty = as.numeric(.data[[maxopp_col]])
+  ) %>%
+  # Collapse to one row per COMPKEY in case of duplicates
+  group_by(COMPKEY) %>%
+  summarise(
+    MinWidth = min(MinWidth, na.rm = TRUE),
+    MinOppty = min(MinOppty, na.rm = TRUE),
+    MaxOppty = max(MaxOppty, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(c(MinWidth, MinOppty, MaxOppty),
+                ~ if_else(is.infinite(.), NA_real_, .)))
+
+streets_joined <- streets_joined %>%
+  left_join(transit_widths, by = "COMPKEY") %>%
+  mutate(has_proposed_bus_lane = !is.na(MinWidth))
+
+# Freeway ramps are excluded from bus-lane impact entirely, regardless of
+# whether they happen to fall inside a proposed bus-lane corridor
+# polygon. Setting `has_proposed_bus_lane = FALSE` here makes the
+# downstream `case_when` send NEW_* to NA (no change) and §5 of
+# Phase2RunSimulation skip the priority-cap reduction for these
+# COMPKEYs. We do this AFTER the join so MinWidth/MinOppty stay in the
+# output for inspection. Note: §6c must have already run to populate
+# `is_freeway_ramp`; the chunk order in this notebook is §6 → §6b → §6c
+# → §7 → §8, so it's already there by the time we get here.
+if ("is_freeway_ramp" %in% names(streets_joined)) {
+  n_ramp_proposed <- sum(streets_joined$is_freeway_ramp &
+                         streets_joined$has_proposed_bus_lane, na.rm = TRUE)
+  if (n_ramp_proposed > 0) {
+    cat(sprintf("Excluding %d freeway-ramp COMPKEYs from bus-lane impact\n",
+                n_ramp_proposed))
+  }
+  streets_joined <- streets_joined %>%
+    mutate(has_proposed_bus_lane = has_proposed_bus_lane &
+                                   !coalesce(is_freeway_ramp, FALSE))
+}
+```
+
+## 8. New through-lane counts (only where a bus lane is proposed)
+
+Each row in `proposed_bus_lanes.geojson` is a *pair* of new bus lanes (one per
+direction); `SEGDIR` is street orientation, not a flow direction. We don't
+blindly subtract because parking, bike lanes, medians, and turn pockets can be
+reallocated to through use. Decision is driven by `MinWidth` under aggressive
+10-ft lanes:
+
+| Min width (ft) | Width-based through-lane proposal                            |
+|----------------|--------------------------------------------------------------|
+| `< 30`         | 0 / 0 (no through capacity could fit alongside a pair of 10-ft bus lanes) |
+| `30 –< 40`     | 1 in one direction (priority: more current lanes; tie -> SEGDIR), 0 in the other |
+| `40 –< 60`     | 1 per direction (capped by current; one-way stays one-way)   |
+| `>= 60`        | Retain current, capped by `floor((width − 21) / 10)` total, distributed by current ratios |
+
+**Sanity bound on NEW lanes**: `new ∈ [max(0, current − 1), current]` per
+direction. Two pieces:
+- upper bound `new ≤ current` — a bus-lane proposal can only remove lanes.
+- lower bound `new ≥ current − 1` — at most one through-lane removed per
+  direction. So `current = 1 → new ∈ {0, 1}` (the one lane may be lost),
+  `current = 2 → new ∈ {1, 2}` (can't drop to 0), etc.
+
+This is *not* a "minimum 1 lane" floor — when `current = 1`, new = 0 is
+fully allowed, which is what happens on a narrow street that genuinely
+can't fit any through-lane alongside the bus lane. The defense against
+pathologically-low `current` values is the **baseline sanity floor**
+applied earlier in §6: 2-way roads start with ≥ 1 each direction, 1-way
+roads with ≥ 1 in the flow direction. So `new = 0` always means "we
+genuinely lost the one through lane we had".
+
+For non-arterial segments with a proposed bus lane, both sides collapse to 0
+(one shared lane retained for local access).
+
+**Divided-road carriageways** (Beacon Ave S, I-5, etc. — detected in §6b
+as paired one-way COMPKEYs going opposite directions) use a separate
+"single bus lane" logic, since only one bus lane is added per carriageway
+(the other goes on the paired carriageway, a different COMPKEY). The
+thresholds are halved relative to the pair logic:
+
+| Min width (ft) | Through lanes outcome (divided carriageway)           |
+|----------------|-------------------------------------------------------|
+| `< 20`         | 0 (local access only)                                 |
+| `20 –< 30`     | 1                                                     |
+| `>= 30`        | Retain current, capped by `floor((width − 10.5) /9.5)`  |
+
+Standalone one-way streets without a paired carriageway nearby (e.g.
+downtown 1st/2nd Ave) keep the standard pair logic above — the intent
+on those streets is to convert them to two-way at the time the bus lanes
+go in.
+
+```{r new-count-fn}
+new_through <- function(width, same_cur, ops_cur, same_priority = TRUE,
+                        is_divided = FALSE) {
+  if (is.na(width)) return(c(NA_integer_, NA_integer_))
+  same_cur <- as.integer(same_cur); ops_cur <- as.integer(ops_cur)
+  # NA lane counts (freeway-class COMPKEYs without SDOT data) can't be
+  # reasoned about for bus-lane impact — return NA so downstream skips
+  # the capacity reduction and leaves OSM-derived lanes alone.
+  if (is.na(same_cur) && is.na(ops_cur)) return(c(NA_integer_, NA_integer_))
+  if (is.na(same_cur)) same_cur <- 0L
+  if (is.na(ops_cur))  ops_cur  <- 0L
+
+  width_based <- if (isTRUE(is_divided)) {
+    # ---- Divided-road carriageway: single bus lane added to THIS carriageway
+    # only (the other half lives on the paired carriageway, a different
+    # COMPKEY). Thresholds are halved vs the pair logic (10 ft / 1 lane
+    # instead of 20 ft / 2 lanes).
+    same_branch <- same_cur > 0
+    eff_cur <- if (same_branch) same_cur else ops_cur
+    if (width < 20) {
+      c(0L, 0L)
+    } else if (width < 30) {
+      if (same_branch) c(1L, 0L) else c(0L, 1L)
+    } else {
+      avail <- as.integer(floor((width - 10) / 10))   # reserve 10 ft for bus
+      new <- as.integer(min(eff_cur, avail))
+      if (same_branch) c(new, 0L) else c(0L, new)
+    }
+  } else if (width < 30) {
+    # ---- Standard pair-of-bus-lanes logic ----
+    c(0L, 0L)
+  } else if (width < 40) {
+    if (same_cur == 0 && ops_cur >  0) {
+      c(0L, 1L)
+    } else if (ops_cur  == 0 && same_cur > 0) {
+      c(1L, 0L)
+    } else if (same_cur > ops_cur) {
+      c(1L, 0L)
+    } else if (ops_cur  > same_cur) {
+      c(0L, 1L)
+    } else if (same_priority) {
+      c(1L, 0L)
+    } else {
+      c(0L, 1L)
+    }
+  } else {
+    avail <- as.integer(floor((width - 21) / 9.5))
+    s <- 0L; o <- 0L
+    if (avail > 0 && same_cur > 0) { s <- 1L; avail <- avail - 1L }
+    if (avail > 0 && ops_cur  > 0) { o <- 1L; avail <- avail - 1L }
+    while (avail > 0 && (s < same_cur || o < ops_cur)) {
+      same_room <- s < same_cur
+      ops_room  <- o < ops_cur
+      if (same_room && !ops_room) {
+        s <- s + 1L
+      } else if (ops_room && !same_room) {
+        o <- o + 1L
+      } else {
+        same_gap <- same_cur - s
+        ops_gap  <- ops_cur  - o
+        if (same_gap > ops_gap) {
+          s <- s + 1L
+        } else if (ops_gap > same_gap) {
+          o <- o + 1L
+        } else {
+          if (same_priority) s <- s + 1L else o <- o + 1L
+        }
+      }
+      avail <- avail - 1L
+    }
+    c(s, o)
+  }
+
+  # ---- Sanity bound: new ∈ [max(0, current − 1), current] per direction ----
+  # Two pieces:
+  #   * upper bound `new ≤ current` — a bus-lane proposal can only remove
+  #     lanes, never add.
+  #   * lower bound `new ≥ current − 1` — at most one lane removed per
+  #     direction. This is NOT "minimum 1 lane" (which would block 0
+  #     outcomes entirely); it's "minimum current − 1". So:
+  #       current = 0 → new = 0 (no traffic in this direction; nothing to remove)
+  #       current = 1 → new ∈ {0, 1}    (the one through lane may be lost)
+  #       current = 2 → new ∈ {1, 2}    (lose at most 1)
+  #       current = 3 → new ∈ {2, 3}    (lose at most 1)
+  #   * floor at 0 to keep values non-negative.
+  # The baseline sanity floor applied earlier in §6 guarantees current ≥ 1
+  # in each through direction (2-way: both; 1-way: flow direction), so
+  # `current − 1` is well-defined and ≥ 0 in practice.
+  new_same <- min(max(width_based[1], same_cur - 1L, 0L), same_cur)
+  new_ops  <- min(max(width_based[2], ops_cur  - 1L, 0L), ops_cur)
+  c(as.integer(new_same), as.integer(new_ops))
+}
+```
+
+```{r new-counts}
+new_pairs <- purrr::pmap(
+  list(streets_joined$MinWidth,
+       streets_joined$SAMELANECOUNT,
+       streets_joined$OPSLANECOUNT,
+       streets_joined$is_divided_carriageway),
+  function(w, s, o, d) new_through(w, s, o,
+                                   same_priority = TRUE,
+                                   is_divided = isTRUE(d))
+)
+
+streets_joined <- streets_joined %>%
+  mutate(
+    NEW_SAMELANECOUNT = vapply(new_pairs, `[`, integer(1), 1),
+    NEW_OPSLANECOUNT  = vapply(new_pairs, `[`, integer(1), 2),
+    # Residential override (only when there's actually a proposed bus lane)
+    NEW_SAMELANECOUNT = case_when(
+      !has_proposed_bus_lane ~ NA_integer_,
+      !is_arterial           ~ 0L,
+      TRUE                   ~ NEW_SAMELANECOUNT
+    ),
+    NEW_OPSLANECOUNT = case_when(
+      !has_proposed_bus_lane ~ NA_integer_,
+      !is_arterial           ~ 0L,
+      TRUE                   ~ NEW_OPSLANECOUNT
+    ),
+    # Freeway ramps: any bus-lane proposal that happens to overlap a ramp
+    # COMPKEY is forced back to current lane counts (no capacity change).
+    # Ramps are short, geometrically constrained, and lane structure is set
+    # by upstream/downstream mainline — they aren't a place to add or
+    # subtract a through-lane for a bus lane.
+    NEW_SAMELANECOUNT = if_else(is_freeway_ramp & has_proposed_bus_lane,
+                                SAMELANECOUNT, NEW_SAMELANECOUNT),
+    NEW_OPSLANECOUNT  = if_else(is_freeway_ramp & has_proposed_bus_lane,
+                                OPSLANECOUNT,  NEW_OPSLANECOUNT)
+  )
+```
+
+## 10. Write the output
+
+```{r write}
+dir.create(dirname(params$street_grid_geojson), recursive = TRUE, showWarnings = FALSE)
+
+out <- streets_joined %>%
+  select(
+    COMPKEY, SEGDIR, OPPDIR,
+    is_arterial, has_proposed_bus_lane,
+    is_divided_carriageway, is_freeway_ramp,
+    SAMELANECOUNT, OPSLANECOUNT,
+    NEW_SAMELANECOUNT, NEW_OPSLANECOUNT,
+    MinWidth, MinOppty, MaxOppty,
+    SAME_START, SAME_END, OPS_START, OPS_END,
+    everything()
+  )
+
+if (file.exists(params$street_grid_geojson)) file.remove(params$street_grid_geojson)
+st_write(out, params$street_grid_geojson, driver = "GeoJSON", quiet = TRUE)
+cat("wrote", nrow(out), "features to", params$street_grid_geojson, "\n")
+```
+
+# Part 3 — SDOT ↔ OSM way-id repair
+
+## Why this part
+
+The canonical SND ↔ OSM map ([`sdot_snd_osm_crosswalk.csv`](data/own/sdot_snd_osm_crosswalk.csv)) was built by a separate spatial-match of SDOT street segments to OSM ways and is occasionally wrong on key corridors. The map collapses to one OSM way per SND_ID, which is also wrong in two specific cases:
+
+1. **OSM-divided / SND-unified** (e.g. Aurora, Lake City Way). OSM treats the divided highway as two `oneway=yes` features; SND treats it as one COMPKEY with two `TRAFFICDIR` rows. The correct mapping is `way_id_NB → (..., TRAFFICDIR=N)`, `way_id_SB → (..., TRAFFICDIR=S)` — a many-to-many on the SND_ID.
+2. **SND-divided** (e.g. Beacon Ave S). SND splits into two COMPKEYs/SND_IDs (NB and SB); OSM is usually two `oneway=yes` features as well. The correct mapping is `way_id_NB → (COMPKEY_NB, SND_ID_NB, N)`, etc.
+
+This part produces [`outputs/streets/way_id_repair.csv`](outputs/streets/way_id_repair.csv) with columns `COMPKEY, SND_ID, TRAFFICDIR, WAY_IDS` (comma-separated). Downstream, [`Phase2RunSimulation.Rmd`](Phase2RunSimulation.Rmd) §4c overlays it on the raw mapping (anti-join on the `(COMPKEY, SND_ID, TRAFFICDIR)` triple, then bind).
+
+## 1. Load the corridor list
+
+The CSV gives a per-corridor filter: `osm_names` matches OSM `name`, `osm_refs` matches OSM `ref` (split on `;` if multi-valued), `snd_ordstnameconcats` matches SND `SND_ORD_STNAME_CONCAT`. Each cell is a comma-separated list; corridors with name changes (e.g. SR-99 → "AURORA AVE N", "AURORA BR", "SR99 TUNNEL NB", …) collect them in one row.
+
+```{r load-corridors}
+corridors_raw <- readr::read_csv(params$corridors_csv,
+                                 show_col_types = FALSE,
+                                 progress = FALSE) |>
+  mutate(corridor_idx = row_number())
+
+split_clean <- function(x) {
+  if (is.na(x) || !nzchar(x)) return(character(0))
+  toupper(stringr::str_trim(strsplit(as.character(x), ",", fixed = TRUE)[[1]]))
+}
+
+corridors <- corridors_raw |>
+  rowwise() |>
+  mutate(
+    osm_names_v   = list(split_clean(osm_names)),
+    osm_refs_v    = list(split_clean(osm_refs)),
+    snd_concats_v = list(split_clean(snd_ordstnameconcats)),
+    label = paste0("[", corridor_idx, "] ",
+                   coalesce(osm_names, osm_refs, snd_ordstnameconcats))
+  ) |>
+  ungroup()
+
+cat("Loaded", nrow(corridors), "corridors\n")
+print(dplyr::select(corridors, corridor_idx, osm_names, osm_refs,
+                    snd_ordstnameconcats))
+```
+
+## 2. Load OSM streetnet (cached)
+
+`StreetSetup.Rmd` writes an `sf` LineString layer of all driveable OSM ways in the PSRC 4-county clip to `outputs/streets/osm_streetnet.rds`. Columns we need: `osm_id`, `name`, `ref`, `oneway`, `highway`, plus geometry.
+
+```{r load-osm}
+stopifnot(file.exists(params$streetnet_rds))
+streetnet <- readRDS(params$streetnet_rds)
+
+# Force osm_id to character WITHOUT going through any numeric coercion.
+# `osmextract` sometimes returns osm_id as double / integer64, and OSM
+# IDs for modern features exceed 2^31; once they touch `double` precision
+# the trailing digits get rounded. `format(., scientific = FALSE, trim
+# = TRUE)` handles double safely (suppresses 1.23e+18 output), and the
+# `bit64` path handles 64-bit ints. If osm_id is already character this
+# is a no-op.
+.osm_id_to_char <- function(x) {
+  if (inherits(x, "integer64")) {
+    if (!requireNamespace("bit64", quietly = TRUE)) {
+      stop("streetnet osm_id is integer64 but the 'bit64' package isn't ",
+           "available — install it or rebuild the streetnet with osm_id ",
+           "as character.")
+    }
+    bit64::as.character.integer64(x)
+  } else if (is.numeric(x)) {
+    .scipen_old <- getOption("scipen")
+    options(scipen = 1000)
+    on.exit(options(scipen = .scipen_old), add = TRUE)
+    format(x, scientific = FALSE, trim = TRUE)
+  } else {
+    as.character(x)
+  }
+}
+.cls_before <- paste(class(streetnet$osm_id), collapse = ",")
+streetnet$osm_id <- .osm_id_to_char(streetnet$osm_id)
+cat(sprintf("streetnet$osm_id coerced %s → character\n", .cls_before))
+
+# Some PBF rows have NA name and NA ref (residential connectors) — they
+# can't be in any corridor, so drop them up front to shrink subsequent work.
+streetnet <- streetnet[!is.na(streetnet$name) | !is.na(streetnet$ref), ]
+cat("OSM ways with a name or ref:", nrow(streetnet), "\n")
+
+streetnet_p <- sf::st_transform(streetnet, params$planar_crs)
+```
+
+## 3. Load Seattle Streets + SND directional rows
+
+SDOT Seattle Streets provides per-COMPKEY linestring geometry; the SND CSV gives the directional (COMPKEY × SND_ID × TRAFFICDIR) row set. Joining the two by `COMPKEY` lets us look up geometry for any SND row.
+
+```{r load-snd}
+streets <- sf::st_read(params$streets_geojson, quiet = TRUE) |>
+  dplyr::select(COMPKEY, STNAME_ORD, SEGDIR, ONEWAY, ONEWAYDIR) |>
+  mutate(COMPKEY = as.integer(COMPKEY)) |>
+  sf::st_transform(params$planar_crs)
+cat("Seattle Streets features:", nrow(streets), "\n")
+
+snd <- readr::read_csv(params$snd_csv,
+                       show_col_types = FALSE,
+                       progress = FALSE) |>
+  transmute(
+    COMPKEY     = suppressWarnings(as.integer(COMPKEY)),
+    SND_ID      = suppressWarnings(as.integer(SND_ID)),
+    TRAFFICDIR  = toupper(stringr::str_trim(as.character(TRAFFICDIR))),
+    STNAME_ORD,
+    SND_ORD_STNAME_CONCAT,
+    OSM_WAY_ID = as.character(OSM_WAY_ID)
+  ) |>
+  filter(!is.na(COMPKEY), !is.na(SND_ID), !is.na(TRAFFICDIR))
+cat("SND directional rows:", nrow(snd), "\n")
+```
+
+## 4. Matching helpers
+
+```{r helpers}
+CARDINAL_BEARING <- c(N =   0, NE = 45,  E = 90,  SE = 135,
+                      S = 180, SW = 225, W = 270, NW = 315)
+
+# Length-weighted mean bearing of a single LineString (planar coords).
+# Returns NA for zero-length / degenerate geometry.
+mean_bearing_planar <- function(line) {
+  m <- sf::st_coordinates(line)
+  if (nrow(m) < 2) return(NA_real_)
+  dx <- diff(m[, "X"])
+  dy <- diff(m[, "Y"])
+  seg_len <- sqrt(dx^2 + dy^2)
+  if (sum(seg_len) == 0) return(NA_real_)
+  # Bearing in degrees clockwise from north for each sub-segment.
+  brng <- (90 - atan2(dy, dx) * 180 / pi) %% 360
+  # Mean as sum of unit vectors weighted by segment length, then atan2.
+  vx <- sum(seg_len * sin(brng * pi / 180))
+  vy <- sum(seg_len * cos(brng * pi / 180))
+  (atan2(vx, vy) * 180 / pi) %% 360
+}
+
+# Angular distance in degrees between two bearings (0-180).
+angular_dist <- function(a, b) {
+  d <- abs((a - b + 180) %% 360 - 180)
+  d
+}
+
+# OSM `oneway` tag → logical. Accepts "yes", "true", "1" as true;
+# "no", "false", "0", NA, "" as false. "-1" (reverse oneway) means
+# the OSM geometry is reversed wrt traffic — we still treat it as
+# directional, but `mean_bearing_planar` of the geometry needs
+# flipping before comparing to SND TRAFFICDIR.
+parse_oneway <- function(x) {
+  x <- tolower(stringr::str_trim(as.character(x)))
+  x[is.na(x) | x == ""] <- params$default_oneway
+  dplyr::case_when(
+    x %in% c("yes", "true", "1") ~ "yes",
+    x == "-1"                     ~ "reverse",
+    TRUE                          ~ "no"
+  )
+}
+
+# For an OSM ref like "I 5;US 99", split on ";" and trim.
+split_osm_ref <- function(x) {
+  if (is.na(x) || !nzchar(x)) return(character(0))
+  toupper(stringr::str_trim(strsplit(as.character(x), ";", fixed = TRUE)[[1]]))
+}
+```
+
+## 5. Per-corridor matching
+
+For each corridor:
+
+* Filter OSM to features whose `name` is in the corridor's name list **or** whose `ref` contains any of the corridor's ref values.
+* Filter SND to rows whose `SND_ORD_STNAME_CONCAT` is in the corridor's list; pull geometry for those COMPKEYs.
+* For each OSM way: sample a point every `sample_spacing_m` along its length, find the nearest in-corridor COMPKEY for each point (capped at `max_sample_dist_m`), and keep the set of unique COMPKEYs it touches.
+* Assign direction: if OSM is `oneway=yes`, match the way's length-weighted bearing to the closest SND `TRAFFICDIR` cardinal for that COMPKEY; if `oneway=-1`, do the same after flipping; if not one-way, attach to every TRAFFICDIR row for that COMPKEY.
+* Emit one row per `(COMPKEY, SND_ID, TRAFFICDIR, way_id)` triple.
+
+```{r match-fn}
+match_one_corridor <- function(crow, n_total) {
+  t0 <- Sys.time()
+  cat(sprintf("\n[%d/%d] %s\n", crow$corridor_idx, n_total, crow$label))
+  flush.console()
+
+  # ---------- (a) OSM filter ----------
+  names_v <- crow$osm_names_v[[1]]
+  refs_v  <- crow$osm_refs_v[[1]]
+
+  osm_name_hit <- if (length(names_v))
+    !is.na(streetnet_p$name) & toupper(streetnet_p$name) %in% names_v
+  else rep(FALSE, nrow(streetnet_p))
+
+  osm_ref_hit <- if (length(refs_v)) {
+    vapply(streetnet_p$ref, function(r) {
+      any(split_osm_ref(r) %in% refs_v)
+    }, logical(1))
+  } else rep(FALSE, nrow(streetnet_p))
+
+  osm_sub <- streetnet_p[osm_name_hit | osm_ref_hit, ]
+  cat("  OSM ways matched (name+ref):", nrow(osm_sub), "\n")
+  if (nrow(osm_sub) == 0) {
+    cat(sprintf("  done (%.1fs) — no OSM ways matched, skipping\n",
+                as.numeric(Sys.time() - t0, units = "secs")))
+    return(tibble())
+  }
+
+  # ---------- (b) SND filter ----------
+  concats_v <- crow$snd_concats_v[[1]]
+  snd_sub <- snd |>
+    filter(toupper(stringr::str_trim(SND_ORD_STNAME_CONCAT)) %in% concats_v)
+  cat("  SND rows matched (SND_ORD_STNAME_CONCAT):", nrow(snd_sub), "\n")
+  if (nrow(snd_sub) == 0) {
+    cat(sprintf("  done (%.1fs) — no SND rows matched, skipping\n",
+                as.numeric(Sys.time() - t0, units = "secs")))
+    return(tibble())
+  }
+
+  compkeys_in_corridor <- unique(snd_sub$COMPKEY)
+  streets_sub <- streets[streets$COMPKEY %in% compkeys_in_corridor, ]
+  cat("  Seattle Streets COMPKEYs available:",
+      nrow(streets_sub), "of", length(compkeys_in_corridor), "\n")
+  if (nrow(streets_sub) == 0) {
+    cat(sprintf("  done (%.1fs) — no COMPKEY geometry, skipping\n",
+                as.numeric(Sys.time() - t0, units = "secs")))
+    return(tibble())
+  }
+
+  # ---------- (c) Sample OSM ways and snap to SND ----------
+  # Number of samples per OSM way: enough to cover its length at
+  # roughly `sample_spacing_m` between points (min 2).
+  osm_len <- as.numeric(sf::st_length(osm_sub))
+  n_samples <- pmax(2L, as.integer(ceiling(osm_len / params$sample_spacing_m)))
+
+  # `st_line_sample` accepts a vector `n` (one value per LineString) and
+  # returns an sfc of MULTIPOINTs. Cast to POINT to explode into one row
+  # per sample, with `osm_row` carrying the originating OSM way.
+  sample_geom <- sf::st_line_sample(osm_sub, n = n_samples)
+  sample_sf <- sf::st_sf(osm_row = seq_len(nrow(osm_sub)),
+                         geometry = sample_geom,
+                         crs = sf::st_crs(osm_sub))
+  pts_sf <- suppressWarnings(sf::st_cast(sample_sf, "POINT"))
+  cat("  OSM sample points:", nrow(pts_sf), "\n")
+
+  # Nearest COMPKEY per sample point.
+  nearest_idx <- sf::st_nearest_feature(pts_sf, streets_sub)
+  nearest_dist <- as.numeric(sf::st_distance(
+    pts_sf, streets_sub[nearest_idx, ], by_element = TRUE))
+
+  hits_all <- tibble(
+    osm_row  = pts_sf$osm_row,
+    COMPKEY  = streets_sub$COMPKEY[nearest_idx],
+    dist_m   = nearest_dist
+  )
+
+  # Strict-tolerance hits (preferred).
+  hits_close <- hits_all |>
+    filter(dist_m <= params$max_sample_dist_m)
+
+  # Fallback: ways that produced ZERO close hits keep their nearest snaps
+  # up to `max_sample_dist_fallback_m`. The name/ref filter has already
+  # restricted us to ways belonging to this corridor, so a farther-away
+  # snap is still informative (e.g. SR-99 Tunnel: OSM geometry runs
+  # underground, SDOT geometry runs at street level, but they're the same
+  # corridor segment).
+  ways_with_close_hits <- unique(hits_close$osm_row)
+  ways_missing <- setdiff(seq_len(nrow(osm_sub)), ways_with_close_hits)
+  hits_far <- if (length(ways_missing)) {
+    hits_all |>
+      filter(osm_row %in% ways_missing,
+             dist_m <= params$max_sample_dist_fallback_m)
+  } else {
+    hits_all[0, , drop = FALSE]
+  }
+  if (nrow(hits_far) > 0) {
+    cat(sprintf("  fallback snap: %d ways had no hit within %.0fm; using nearest within %.0fm (%d points)\n",
+                length(unique(hits_far$osm_row)),
+                params$max_sample_dist_m,
+                params$max_sample_dist_fallback_m,
+                nrow(hits_far)))
+  }
+
+  hits <- dplyr::bind_rows(hits_close, hits_far)
+
+  if (nrow(hits) == 0) {
+    cat(sprintf("  done (%.1fs) — no sample points within max_sample_dist_fallback_m\n",
+                as.numeric(Sys.time() - t0, units = "secs")))
+    return(tibble())
+  }
+
+  # For each OSM way, list the unique COMPKEYs it touches and their
+  # representative (nearest) distance, used for diagnostics only.
+  per_way_compkeys <- hits |>
+    group_by(osm_row, COMPKEY) |>
+    summarise(min_dist_m = min(dist_m), n_pts = n(),
+              .groups = "drop")
+  cat("  unique (OSM × COMPKEY) hits:", nrow(per_way_compkeys), "\n")
+
+  # ---------- (d) OSM way attributes (way_id, bearing, oneway) ----------
+  osm_attrs <- tibble(
+    osm_row = seq_len(nrow(osm_sub)),
+    way_id  = as.character(osm_sub$osm_id),
+    oneway  = parse_oneway(osm_sub$oneway),
+    bearing = vapply(seq_len(nrow(osm_sub)),
+                     function(i) mean_bearing_planar(osm_sub$geometry[i]),
+                     numeric(1))
+  ) |>
+    # `oneway=-1` means OSM geometry is reversed wrt traffic, so flip
+    # the bearing 180° before any TRAFFICDIR comparison.
+    mutate(bearing = if_else(oneway == "reverse",
+                             (bearing + 180) %% 360,
+                             bearing),
+           oneway_logical = oneway %in% c("yes", "reverse"))
+
+  per_way_compkeys <- per_way_compkeys |>
+    left_join(osm_attrs, by = "osm_row")
+
+  # ---------- (e) Direction inference ----------
+  # For each (OSM way × COMPKEY) hit, look up the SND rows available for
+  # that COMPKEY (one per TRAFFICDIR). For oneway OSM, pick the single
+  # closest TRAFFICDIR by cardinal bearing distance. For non-oneway OSM,
+  # emit one row per TRAFFICDIR.
+  snd_by_ck <- snd_sub |>
+    select(COMPKEY, SND_ID, TRAFFICDIR) |>
+    distinct()
+
+  out <- per_way_compkeys |>
+    inner_join(snd_by_ck, by = "COMPKEY",
+               relationship = "many-to-many") |>
+    mutate(td_bearing = unname(CARDINAL_BEARING[TRAFFICDIR]),
+           bearing_gap = if_else(oneway_logical & !is.na(bearing) & !is.na(td_bearing),
+                                 angular_dist(bearing, td_bearing),
+                                 NA_real_)) |>
+    group_by(osm_row, COMPKEY) |>
+    mutate(
+      keep = if (any(oneway_logical) && !all(is.na(bearing_gap))) {
+        # One-way OSM: pick the single closest TRAFFICDIR for this COMPKEY,
+        # but only if the bearing is actually aligned (<90° off). A larger
+        # gap means the OSM way is heading the wrong way for every
+        # TRAFFICDIR present on this COMPKEY — typically an SND-divided
+        # case where the sample point happened to snap to the opposite-
+        # direction COMPKEY across the median. Drop those rather than
+        # emit a contradictory mapping.
+        is_min <- bearing_gap == min(bearing_gap, na.rm = TRUE) &
+                  !is.na(bearing_gap)
+        is_min & bearing_gap < 90
+      } else {
+        # Two-way OSM: attach to every TRAFFICDIR of the COMPKEY.
+        rep(TRUE, dplyr::n())
+      }
+    ) |>
+    ungroup() |>
+    filter(keep) |>
+    transmute(COMPKEY = as.integer(COMPKEY),
+              SND_ID = as.integer(SND_ID),
+              TRAFFICDIR,
+              way_id,
+              osm_oneway = oneway,
+              osm_bearing = bearing,
+              td_bearing,
+              bearing_gap,
+              min_sample_dist_m = min_dist_m,
+              corridor_idx = crow$corridor_idx,
+              corridor_label = crow$label)
+
+  # Per-corridor coverage diagnostic.
+  covered_ck <- length(unique(out$COMPKEY))
+  missing_ck <- setdiff(compkeys_in_corridor, out$COMPKEY)
+  cat(sprintf("  COMPKEYs covered: %d / %d (missing %d)\n",
+              covered_ck, length(compkeys_in_corridor), length(missing_ck)))
+  if (length(missing_ck) > 0 && length(missing_ck) <= 20) {
+    cat("    missing:", paste(missing_ck, collapse = ","), "\n")
+  }
+  cat(sprintf("  done (%.1fs) — emitted %d rows\n",
+              as.numeric(Sys.time() - t0, units = "secs"),
+              nrow(out)))
+  out
+}
+
+cat("\nProcessing", nrow(corridors), "corridors...\n")
+t_all <- Sys.time()
+results <- purrr::map_dfr(seq_len(nrow(corridors)), function(i) {
+  match_one_corridor(corridors[i, ], n_total = nrow(corridors))
+})
+cat(sprintf("\nAll %d corridors done in %.1fs. Total hits: %d\n",
+            nrow(corridors),
+            as.numeric(Sys.time() - t_all, units = "secs"),
+            nrow(results)))
+```
+
+## 6. Build the repair table
+
+Collapse to one row per `(COMPKEY, SND_ID, TRAFFICDIR)` with comma-separated `WAY_IDS`. A given way_id may legitimately appear in multiple rows (a long OSM way that spans many SND COMPKEYs); a given `(COMPKEY, SND_ID, TRAFFICDIR)` triple may legitimately have multiple way_ids (a short SND segment hit by multiple OSM features at a transition).
+
+```{r build-repair}
+repair_long <- results |>
+  distinct(COMPKEY, SND_ID, TRAFFICDIR, way_id)
+
+# Sanity: drop rows where any key column ended up NA.
+n_drop <- sum(is.na(repair_long$COMPKEY) | is.na(repair_long$SND_ID) |
+              is.na(repair_long$TRAFFICDIR) | is.na(repair_long$way_id))
+if (n_drop > 0) {
+  cat("Dropping", n_drop, "rows with NA in key columns\n")
+  repair_long <- repair_long |>
+    filter(!is.na(COMPKEY), !is.na(SND_ID),
+           !is.na(TRAFFICDIR), !is.na(way_id))
+}
+
+repair_wide <- repair_long |>
+  arrange(COMPKEY, SND_ID, TRAFFICDIR, way_id) |>
+  group_by(COMPKEY, SND_ID, TRAFFICDIR) |>
+  summarise(WAY_IDS = paste(way_id, collapse = ","), .groups = "drop")
+
+cat("Repair rows (triples):", nrow(repair_wide), "\n")
+cat("Repair rows (way_id-level):", nrow(repair_long), "\n")
+cat("Distinct way_ids in repair:", length(unique(repair_long$way_id)), "\n")
+
+dir.create(dirname(params$repair_csv), recursive = TRUE, showWarnings = FALSE)
+# `quote = "all"` forces every cell to be quoted, including WAY_IDS values
+# that happen to be all-digits when there's only one way_id per triple.
+# Without this, readr's type inference reads the column as numeric on
+# subsequent reads, which (a) loses precision for OSM IDs > 2^53 via
+# scientific notation, and (b) eats the commas in multi-way_id rows,
+# silently breaking the part-2 §4c override. quote = "all" makes the CSV
+# unambiguously character on round-trip.
+readr::write_csv(repair_wide, params$repair_csv, quote = "all")
+cat("Wrote:", normalizePath(params$repair_csv), "\n")
+```

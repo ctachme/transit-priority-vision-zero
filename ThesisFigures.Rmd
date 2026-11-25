@@ -1,0 +1,240 @@
+---
+title: "Thesis figures - chart data and map layers"
+output: html_document
+params:
+  phase2_dir:   "outputs/phase2"
+  node_dir:     "outputs/node_design"
+  sens_dir:     "outputs/sensitivity"
+  cache_dir:    "cache"
+  snapped_nodes_shp: "data/own/node_stops/corridor_stops.shp"
+  daysim_trips_tsv:  "data/public/soundcast/_trip.tsv"
+  daysim_parcel_map: "data/public/soundcast/parcel_2023_geography.csv"
+  am_hours:     !r c(7, 10)          # AM peak, as in Phase2RunSimulation.Rmd
+  out_dir:      "outputs/figures"
+---
+
+The thesis charts were drawn in Office and the maps in ArcGIS Pro, so this
+notebook writes the data behind each data-driven figure rather than images:
+
+* chart data - `outputs/figures/figure_NN_<name>.csv`
+* map layers - `outputs/figures/figure_layers.gpkg` (EPSG:2926), one layer per figure
+
+| Figure | Output |
+|---|---|
+| 3, 4, 5 - travel-time accuracy before / after calibration | `figure_03_*.csv`, `figure_04_*.csv`, `figure_05_*.csv` |
+| 14 - half-mile cells by travel demand | layer `fig14_cells_demand` |
+| 15 - the 12 nodes | layer `fig15_nodes` |
+| 18 - AM peak gateway flows | layers `fig18_*`, `figure_18_inbound_gateway_volumes.csv` |
+| 19, 20 - change in transit / drive job accessibility, Grid with AV traffic | layer `fig19_20_accessibility_change` |
+| 21 - street speed change, Grid with AV traffic | layer `fig21_speed_change` |
+| 22-27 - sensitivity sweeps | `figure_22_27_sensitivity_sweeps.csv` |
+
+Figures drawn directly from pipeline inputs or outputs need no step here: 9 and
+12 (designed grid networks: `data/own/grid_network.gpkg`), 17 (node feeder
+routes: `outputs/node_design/local_routes.shp`), and 10, 11, 13 (walksheds
+drawn in ArcGIS from the GTFS stops). Figures 1, 2, 6-8 and 16 are not data
+figures.
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(sf); library(data.table)
+})
+dir.create(params$out_dir, recursive = TRUE, showWarnings = FALSE)
+GPKG <- file.path(params$out_dir, "figure_layers.gpkg")
+write_layer <- function(x, layer) st_write(x, GPKG, layer = layer, delete_layer = TRUE, quiet = TRUE)
+latest_cache <- function(label) {
+  f <- list.files(params$cache_dir, sprintf("^%s_[0-9a-f]+\\.rds$", label), full.names = TRUE)
+  if (!length(f)) stop("No cache file for ", label)
+  readRDS(f[which.max(file.info(f)$mtime)])
+}
+```
+
+# Figures 3, 4, 5. Travel-time accuracy before and after calibration
+
+Observed HTS trip durations against the routed travel time, as binned medians
+with the 25-75th percentile band. Figure 3: raw times by mode; Figure 4: raw
+drive times by time of day; Figure 5: drive calibrated, other modes raw. Each
+series is trimmed at its 99th percentile on both axes. Input: the `calviz_*`
+snapshots written by `Phase1BuildMNL.Rmd`.
+
+```{r calibration}
+trips_skim <- readRDS(file.path(params$cache_dir, "calviz_trips_skim.rds"))
+trips_cal  <- readRDS(file.path(params$cache_dir, "calviz_trips_cal.rds"))
+tod_levels <- c("AM", "Midday", "PM", "Evening", "Night")
+
+frame <- function(df, drive_col) df |>
+  mutate(predicted = case_when(mode_norm == "walk" ~ walk_tt_raw, mode_norm == "bike" ~ bike_tt_raw,
+                               mode_norm == "drive" ~ .data[[drive_col]],
+                               mode_norm == "transit" ~ transit_total_raw)) |>
+  transmute(mode_norm = factor(mode_norm, c("drive", "walk", "bike", "transit")),
+            observed = duration_minutes, predicted, tod_bin = factor(tod_bin, tod_levels)) |>
+  filter(predicted > 0, observed > 0, !is.na(tod_bin))
+trim99 <- function(df) df |> filter(predicted <= quantile(predicted, 0.99),
+                                    observed  <= quantile(observed, 0.99))
+# Bins adapt to group size (about min_n trips per bin, 3..n_bins bins).
+bins <- function(df, group, n_bins = 50, min_n = 20) df |>
+  group_by(across(all_of(group))) |>
+  mutate(bin = ntile(predicted, pmax(3L, pmin(n_bins, n() %/% min_n)))) |>
+  group_by(across(all_of(c(group, "bin")))) |>
+  summarise(pred_min = round(median(predicted), 2), obs_med_min = round(median(observed), 2),
+            obs_p25_min = round(quantile(observed, 0.25), 2),
+            obs_p75_min = round(quantile(observed, 0.75), 2), n_trips = n(), .groups = "drop") |>
+  filter(n_trips >= 10) |> rename(series = all_of(group))
+out_csv <- function(df, name) write_csv(df, file.path(params$out_dir, paste0(name, ".csv")))
+
+pre  <- frame(trips_skim, "drive_tt_raw")
+post <- frame(trips_cal,  "drive_tt_cal")
+out_csv(pre  |> group_by(mode_norm) |> trim99() |> ungroup() |> bins("mode_norm"),
+        "figure_03_precal_by_mode")
+out_csv(pre  |> filter(mode_norm == "drive") |> trim99() |> bins("tod_bin", 40, 30),
+        "figure_04_precal_drive_by_tod")
+out_csv(post |> group_by(mode_norm) |> trim99() |> ungroup() |> bins("mode_norm"),
+        "figure_05_postcal_by_mode")
+```
+
+# Figures 14 and 15. Demand cells and nodes
+
+```{r cells-nodes}
+gd <- readRDS(file.path(params$node_dir, "grid_demand_2640ft.rds"))
+st_geometry(gd) <- "geom"
+pm <- readRDS(file.path(params$node_dir, "pmedian_p12.rds"))
+rail <- readRDS(file.path(params$node_dir, "rail_corridors.rds"))$corridors
+link_cells <- unique(unlist(lapply(rail, function(rc) rc$corridor_cells$cell_id)))
+
+cells <- gd |> st_transform(2926) |>
+  left_join(pm$assignment |> select(cell_id, assigned_node, dist_to_node_mi, is_node, is_forced_node),
+            by = "cell_id") |>
+  mutate(log10_demand = ifelse(total_demand > 0, log10(total_demand), NA_real_),
+         is_link_cell = cell_id %in% link_cells)
+write_layer(cells, "fig14_cells_demand")
+
+# Node points at the ArcGIS-snapped locations (cell centroid where not snapped).
+nodes <- st_centroid(cells |> filter(is_node)) |> select(cell_id, total_demand, is_forced_node)
+snap <- st_read(params$snapped_nodes_shp, quiet = TRUE) |> st_transform(2926)
+names(snap) <- tolower(names(snap))
+i <- match(nodes$cell_id, snap$cell_id); ok <- !is.na(i)
+st_geometry(nodes)[ok] <- st_geometry(snap)[i[ok]]
+write_layer(nodes |> mutate(kind = ifelse(is_forced_node, "rail_snapped", "algorithm")), "fig15_nodes")
+```
+
+# Figure 18. AM peak gateway flows
+
+Each external tract's AM trips into Seattle, routed on the free-flow road path
+to the inbound gateway it was assigned to in Phase 2 (stages 6a-6b); trips are
+summed per road segment for the flow-width layer. Trips: SoundCast, expansion
+factor weighted, school bus excluded, departures in the AM peak.
+
+```{r gateways}
+gm    <- latest_cache("gateway_match_v3")
+od_am <- latest_cache("od_daysim_am")
+graph <- latest_cache("dodgr_motorcar_caps")
+verts <- dodgr::dodgr_vertices(graph)
+
+gw_in <- gm$gateways_v$inbound |> mutate(id = as.character(id)) |>
+  left_join(od_am |> filter(startsWith(origin_id, "GW_"), !startsWith(dest_id, "GW_")) |>
+              group_by(id = origin_id) |> summarise(am_inbound_trips = sum(trips), .groups = "drop"),
+            by = "id") |>
+  left_join(gm$ext_centroids |> count(id = as.character(gateway_inbound), name = "n_tracts_assigned"),
+            by = "id") |>
+  mutate(am_inbound_trips = coalesce(am_inbound_trips, 0), n_tracts_assigned = coalesce(n_tracts_assigned, 0L))
+ext <- gm$ext_centroids |>
+  mutate(gateway_inbound = as.character(gateway_inbound), vertex = as.character(vertex)) |>
+  filter(gateway_inbound %in% gw_in$id)
+
+# Per external tract: AM trips into Seattle (SoundCast).
+con <- DBI::dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+pmap <- fread(params$daysim_parcel_map, select = c("ParcelID", "Census2020Tract"))
+duckdb::duckdb_register(con, "pm", pmap[, .(ParcelID, tract = sprintf("%011.0f", as.numeric(Census2020Tract)))])
+od_tract <- DBI::dbGetQuery(con, sprintf("
+  SELECT o.tract AS origin_tract, d.tract AS dest_tract, sum(t.trexpfac) AS trips
+  FROM read_csv_auto('%s', delim='\t') t
+  JOIN pm o ON t.opcl = o.ParcelID JOIN pm d ON t.dpcl = d.ParcelID
+  WHERE t.deptm >= %d AND t.deptm < %d AND t.mode <> 8
+  GROUP BY 1, 2", normalizePath(params$daysim_trips_tsv, winslash = "/"),
+  params$am_hours[1] * 60L, params$am_hours[2] * 60L))
+DBI::dbDisconnect(con, shutdown = TRUE)
+ext <- ext |>
+  left_join(od_tract |> filter(origin_tract %in% gm$ext_centroids$id,
+                               !dest_tract %in% gm$ext_centroids$id) |>
+              group_by(id = origin_tract) |> summarise(am_trips = sum(trips), .groups = "drop"),
+            by = "id") |>
+  mutate(am_trips = coalesce(am_trips, 0))
+
+paths <- dodgr::dodgr_paths(graph, from = ext$vertex,
+                            to = gw_in$vertex[match(ext$gateway_inbound, gw_in$id)], pairwise = TRUE)
+vseq <- lapply(paths, function(p) if (is.list(p)) p[[1]] else p)
+vx <- setNames(verts$x, verts$id); vy <- setNames(verts$y, verts$id)
+
+seg <- rbindlist(lapply(seq_len(nrow(ext)), function(i) {
+  v <- vseq[[i]]; if (length(v) < 2) return(NULL)
+  data.table(v0 = v[-length(v)], v1 = v[-1], trips = ext$am_trips[i])
+}))[, .(am_trips = sum(trips)), by = .(v0, v1)][am_trips > 0]
+road_flows <- st_sf(am_trips = round(seg$am_trips, 1),
+                    geometry = st_sfc(lapply(seq_len(nrow(seg)), function(i)
+                      st_linestring(rbind(c(vx[seg$v0[i]], vy[seg$v0[i]]), c(vx[seg$v1[i]], vy[seg$v1[i]])))),
+                      crs = 4326)) |> st_transform(2926)
+write_layer(road_flows, "fig18_road_flows")
+write_layer(st_as_sf(gw_in |> select(id, label, am_inbound_trips, n_tracts_assigned, lon, lat),
+                     coords = c("lon", "lat"), crs = 4326) |> st_transform(2926),
+            "fig18_gateways_inbound")
+write_csv(gw_in |> transmute(gateway_id = id, label, am_inbound_trips = round(am_inbound_trips),
+                             n_tracts_assigned) |> arrange(desc(am_inbound_trips)),
+          file.path(params$out_dir, "figure_18_inbound_gateway_volumes.csv"))
+```
+
+# Figures 19 and 20. Change in job accessibility, Grid with AV traffic
+
+Jobs reachable within 30 minutes per tract, Grid network with transit priority
+and AV-induced traffic, as a multiple of the baseline (existing network,
+current streets).
+
+```{r accessibility}
+acc <- read_csv(file.path(params$phase2_dir, "employment_accessibility_by_tract_wide.csv"), col_types = readr::cols(GEOID = "c"),
+                show_col_types = FALSE)
+pick <- function(cfg) acc |> filter(config_id == cfg) |>
+  select(GEOID, drive = jobs_30min_drive, transit = jobs_30min_transit)
+chg <- inner_join(pick("baseline__no_pri_no_av"), pick("grid__pri_av"), by = "GEOID",
+                  suffix = c("_baseline", "_grid_pri_av")) |>
+  mutate(drive_change_x = drive_grid_pri_av / drive_baseline,
+         transit_change_x = transit_grid_pri_av / transit_baseline)
+tracts <- latest_cache("tracts_sf") |> st_transform(2926) |> select(GEOID)
+write_layer(inner_join(tracts, chg, by = "GEOID"), "fig19_20_accessibility_change")
+```
+
+# Figure 21. Street speed change, Grid with AV traffic
+
+Daily average speed per OSM way, Grid network with transit priority and AV
+traffic versus the baseline, from the Phase 2 street layer.
+
+```{r speed-change}
+edges <- st_read(file.path(params$phase2_dir, "arcgis_layers", "network_full.gpkg"), layer = "edges",
+                 query = "SELECT way_id, highway, category, dly_bsl_curr_speed, dly_grid_priav_speed,
+                                 dly_grid_priav_dspeed, geom FROM edges WHERE dly_grid_priav_speed IS NOT NULL",
+                 quiet = TRUE)
+write_layer(st_transform(edges, 2926), "fig21_speed_change")
+```
+
+# Figures 22-27. Sensitivity sweeps
+
+Treatment (Grid + Local, transit priority, AV traffic) and baseline transit mode
+share and network-average speed at each value of the three equilibrium
+constants (AM peak). The base render supplies every sweep's centre point.
+
+```{r sensitivity}
+sm <- read_csv(file.path(params$sens_dir, "sensitivity_metrics.csv"), show_col_types = FALSE)
+base_vals <- c(av_drive_tt_shrink = 0.41, bpr_vc_cap = 2.0, auto_occupancy = 1.10)
+sweeps <- bind_rows(lapply(names(base_vals), function(p) bind_rows(
+  sm |> filter(tag == "base") |> mutate(param_name = p, param_value = base_vals[[p]]),
+  sm |> filter(param_name == p)))) |>
+  select(param_name, param_value, role, transit, avg_speed_mph) |>
+  pivot_wider(names_from = role, values_from = c(transit, avg_speed_mph)) |>
+  transmute(param_name, param_value, is_base = param_value == base_vals[param_name],
+            transit_share_baseline_pct = round(100 * transit_baseline, 2),
+            transit_share_treatment_pct = round(100 * transit_treatment, 2),
+            avg_speed_baseline_mph = round(avg_speed_mph_baseline, 2),
+            avg_speed_treatment_mph = round(avg_speed_mph_treatment, 2)) |>
+  arrange(param_name, param_value)
+write_csv(sweeps, file.path(params$out_dir, "figure_22_27_sensitivity_sweeps.csv"))
+sweeps
+```
