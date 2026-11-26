@@ -9,7 +9,8 @@ params:
   sens_root:  "./outputs/sensitivity"   # one subfolder of Phase 2 CSVs per render point
   cache_dir:  "./cache"                 # shared across renders (reuses skims and networks)
   force_rerun:  false                   # TRUE = re-render even if a point's CSVs exist
-  java_heap_gb: 20
+  workers:      1                       # renders run at the same time (run_pipeline.R sets this)
+  java_heap_gb: 20                      # per render
   vz_baseline_fatalities: 29.4
   vz_hughes_elasticity:   1.0
   vz_nilsson_exp_fatal:   3.0
@@ -68,17 +69,21 @@ render_points
 # Renders
 
 Each render is a fresh R process (clean r5r Java VM) with all three constants
-pinned explicitly; an off-base point overrides just one of them.
+pinned explicitly; an off-base point overrides just one of them. The base point
+runs first, on its own: it builds the networks, skims and flow seeds the other
+points reuse from the shared cache. The remaining points then run
+`params$workers` at a time. Each render's console output goes to
+`outputs/sensitivity/<tag>.log` and its progress to
+`logs/sensitivity_<tag>.progress.log`.
 
 ```{r renders}
 rscript <- file.path(R.home("bin"), if (.Platform$OS.type == "windows") "Rscript.exe" else "Rscript")
 needed_csvs <- c("mode_share_by_config_tod.csv", "vmt_speed_by_config_tod.csv",
                  "employment_accessibility_by_tract_mode_tod.csv")
+point_done <- function(tag) all(file.exists(file.path(SENS_ROOT, tag, needed_csvs)))
 
-for (i in seq_len(nrow(render_points))) {
-  rp <- render_points[i, ]
+launch_point <- function(rp) {
   out_dir <- file.path(SENS_ROOT, rp$tag)
-  if (!params$force_rerun && all(file.exists(file.path(out_dir, needed_csvs)))) next
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
   ov <- base_vals
   if (!rp$is_base) ov[[rp$param_name]] <- rp$param_value
@@ -89,15 +94,43 @@ for (i in seq_len(nrow(render_points))) {
   driver <- tempfile(fileext = ".R")
   writeLines(c(
     "options(warn = 1)",
-    sprintf("rmarkdown::render(%s, output_format = 'html_document', run_pandoc = FALSE,",
-            deparse(params$scenario_pipeline)),
+    sprintf("rmd <- file.path(tempdir(), %s); file.copy(%s, rmd)",
+            deparse(params$scenario_pipeline), deparse(params$scenario_pipeline)),
+    "rmarkdown::render(rmd, output_format = 'html_document', run_pandoc = FALSE, knit_root_dir = getwd(),",
     sprintf("  quiet = TRUE, envir = new.env(), params = %s)",
             paste(deparse(plist), collapse = " "))), driver)
-  message(sprintf("render %s (%s = %s)", rp$tag, rp$param_name, rp$param_value))
-  status <- system2(rscript, shQuote(driver))
-  if (!identical(status, 0L) || !all(file.exists(file.path(out_dir, needed_csvs))))
-    stop("Sensitivity render failed: ", rp$tag)
+  progress_log <- fs_path(file.path(getwd(), "logs", paste0("sensitivity_", rp$tag, ".progress.log")))
+  message(sprintf("[%s] start %s (%s = %s)", format(Sys.time(), "%H:%M:%S"),
+                  rp$tag, rp$param_name, rp$param_value))
+  processx::process$new(rscript, driver, stdout = file.path(SENS_ROOT, paste0(rp$tag, ".log")),
+                        stderr = "2>&1", env = c("current", PIPELINE_LOG = progress_log))
 }
+
+run_points <- function(points, n) {
+  queue <- split(points, seq_len(nrow(points)))
+  running <- list(); failed <- character()
+  while (length(queue) || length(running)) {
+    for (tg in names(running)) if (!running[[tg]]$is_alive()) {
+      ok <- identical(running[[tg]]$get_exit_status(), 0L) && point_done(tg)
+      message(sprintf("[%s] %s %s", format(Sys.time(), "%H:%M:%S"),
+                      if (ok) "done  " else "FAILED", tg))
+      if (!ok) failed <- c(failed, tg)
+      running[[tg]] <- NULL
+    }
+    while (length(running) < n && length(queue)) {
+      rp <- queue[[1]]; queue <- queue[-1]
+      running[[rp$tag]] <- launch_point(rp)
+    }
+    if (length(running)) Sys.sleep(10)
+  }
+  if (length(failed))
+    stop("Sensitivity render(s) failed: ", paste(failed, collapse = ", "),
+         " - see outputs/sensitivity/<tag>.log")
+}
+
+todo <- render_points[params$force_rerun | !vapply(render_points$tag, point_done, logical(1)), ]
+run_points(todo[todo$is_base, ], 1)
+run_points(todo[!todo$is_base, ], max(1L, as.integer(params$workers)))
 ```
 
 # Collect metrics

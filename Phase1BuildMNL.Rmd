@@ -273,25 +273,31 @@ CRS_PLANAR <- 32610
 # uniformly readable. log_stage() opens a new section; log_msg() inside.
 .log_start_time <- Sys.time()
 
+# Mirrored to a plain log file so a headless render can be followed live
+# (run_pipeline.R sets PIPELINE_LOG; the default is logs/phase1_progress.log).
+.RUN_LOG <- Sys.getenv("PIPELINE_LOG", file.path(getwd(), "logs", "phase1_progress.log"))
+dir.create(dirname(.RUN_LOG), showWarnings = FALSE, recursive = TRUE)
+try(cat("", file = .RUN_LOG), silent = TRUE)   # truncate at the start of each run
+.tee <- function(txt) {
+  cat(txt)
+  try(cat(txt, file = .RUN_LOG, append = TRUE), silent = TRUE)
+}
+
 log_stage <- function(stage) {
   sep <- paste(rep("=", 76), collapse = "")
-  cat("\n", sep, "\n", sep = "")
-  cat(sprintf("[%s] %s\n",
-              format(Sys.time(), "%Y-%m-%d %H:%M:%S"), stage))
-  cat(sep, "\n", sep = "")
+  .tee(sprintf("\n%s\n[%s] %s\n%s\n", sep,
+               format(Sys.time(), "%Y-%m-%d %H:%M:%S"), stage, sep))
 }
 
 log_msg <- function(...) {
-  cat(sprintf("[%s] %s\n",
-              format(Sys.time(), "%H:%M:%S"),
-              paste0(..., collapse = "")))
+  .tee(sprintf("[%s] %s\n", format(Sys.time(), "%H:%M:%S"),
+               paste0(..., collapse = "")))
 }
 
 log_done <- function(label, t0) {
   dt <- difftime(Sys.time(), t0, units = "secs")
-  cat(sprintf("[%s] DONE %s (%.1f sec)\n",
-              format(Sys.time(), "%H:%M:%S"),
-              label, as.numeric(dt)))
+  .tee(sprintf("[%s] DONE %s (%.1f sec)\n",
+               format(Sys.time(), "%H:%M:%S"), label, as.numeric(dt)))
 }
 
 # Cache: hash inputs and store on disk. with_cache() takes a label, an

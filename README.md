@@ -12,29 +12,43 @@ Vision Zero outcomes in Seattle. The pipeline
    speeds and VMT, job accessibility, equity correlation and projected fatalities and
    serious injuries.
 
-Everything is R (developed on R 4.5.2, Windows, 16 cores / 110 GB RAM). Routing uses
+Everything is R (developed on R 4.5.2, Windows, 16 cores / 110 GB RAM; the `--quick` check also runs on 6 cores / 55 GB). Routing uses
 [r5r](https://ipeagit.github.io/r5r/) (needs Java 21) and
 [dodgr](https://urbananalyst.github.io/dodgr/).
 
 ## How to run
 
 ```
-Rscript run_pipeline.R            # every stage, in order; resumes after an interruption
-Rscript run_pipeline.R --quick    # stages 1-6, Phase 2 for two scenarios at midday only
-Rscript run_pipeline.R --list     # show the stage list
-Rscript run_pipeline.R 2 4        # only stages 2..4
+Rscript run_pipeline.R              # every stage, in order; resumes after an interruption
+Rscript run_pipeline.R --quick      # stages 1-6, with Phase 2 reduced to five check runs
+Rscript run_pipeline.R 5 7          # only stages 5..7
+Rscript run_pipeline.R --workers 3  # how many R processes run side by side
+Rscript run_pipeline.R --status     # progress of a run in progress (also in logs/STATUS.txt)
+Rscript run_pipeline.R --list       # show the stage list
 ```
 
-Run from the repository root, after placing the input data (see "Data"). Each stage is
-one notebook, rendered in its own R process; console output goes to `logs/<stage>.log`
-and a finished stage leaves `logs/<stage>.done` so it is skipped next time. Every notebook
-can also be opened and run interactively in RStudio, with the repository root as the
-working directory.
+Run from the repository root, after placing the input data (see "Data"). Every notebook
+render is its own R process: console output goes to `logs/<name>.log`, progress (the
+chunk it is in, plus the notebook's own progress messages) to `logs/<name>.progress.log`,
+and a finished render leaves `logs/<name>.done` so it is skipped next time.
+`--status` (or `logs/STATUS.txt`, refreshed every 15 seconds while a run is going) shows
+each stage's state, how long each running render has been going, and its latest
+progress line. Every notebook can also be opened and run interactively in RStudio, with
+the repository root as the working directory.
 
-`--quick` checks that the whole pipeline runs without the day-long scenario matrix: Phase 2
-solves only the midday period for the baseline and two scenarios — Grid + Local with
-transit priority and AV traffic, and the existing network with AV traffic — writing to
-`outputs/phase2_quick/`.
+Phase 2 and the sensitivity analysis run in parallel. For Phase 2, a primer render
+caches the shared networks, skims and per-time-of-day flow seeds; one render per
+configuration then solves its five equilibria into the shared cache, `--workers` at a
+time; a final render assembles every table from the cache. The sensitivity analysis
+renders its base point first, then the other points `--workers` at a time. Each Phase 2
+render needs about 20 GB of memory, so `--workers` defaults to the machine's RAM / 20 GB.
+
+`--quick` checks that the whole pipeline runs without the full scenario matrix: Phase 2
+solves five check runs, each transit network once at a different time of day and street
+scenario (Grid + Local with priority and AV at AM, Node-based with priority at midday, the
+existing network with AV at PM, 3x with priority and AV in the evening, Grid with priority
+at night), each with the baseline it is compared with. Results go to
+`outputs/phase2_quick/<time of day>_<configuration>/`.
 
 Before the first run:
 
@@ -43,12 +57,12 @@ Before the first run:
   (free: <https://api.census.gov/data/key_signup.html>).
 * The two Phase notebooks install missing R packages on demand; the others assume
   `sf dplyr tidyr data.table dodgr r5r osmextract osmdata tigris tidycensus mlogit dfidx
-  mgcv duckdb gtfsio zip httr ompr ompr.roi ROI.plugin.highs highs matrixStats` are present.
+  mgcv duckdb gtfsio zip httr ompr ompr.roi ROI.plugin.highs highs matrixStats processx ps`
+  are present.
 
-A full run is long: Phase 2 solves 70 equilibria (14 configurations x 5 times of day)
-and took most of a day on the machine above, and the sensitivity stage re-runs part of
-Phase 2 nine more times. All heavy steps cache their results under `cache/`, so a re-run
-only recomputes what changed.
+A full run is long: Phase 2 solves 70 equilibria (14 configurations x 5 times of day),
+and the sensitivity stage re-runs part of Phase 2 at seven more settings. All heavy steps
+cache their results under `cache/`, so a re-run only recomputes what changed.
 
 ## Pipeline stages
 

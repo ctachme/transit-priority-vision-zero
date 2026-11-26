@@ -419,10 +419,10 @@ save_table(t18, "table_18_acs_comparison")
 # Tables 19-23, 26-28. Results by configuration
 
 ```{r tables-19-28}
-tt <- p2("transit_tt_stats_by_config_tod.csv") |> filter(tod == "AM")
-save_table(grid_table(setNames(sprintf("%.1f", tt$median_min), tt$config_id),
+# Daily median (hours- and trips-weighted across the five times of day).
+save_table(grid_table(setNames(sprintf("%.1f", summ$transit_tt_median_min), summ$config_id),
                       c("no_pri_no_av", "no_pri_av", "pri_no_av")),
-           "table_19_transit_travel_time_am_median")
+           "table_19_transit_travel_time_median")
 
 save_table(grid_table(setNames(sprintf("%.1f%%", summ$walkshed_pct_seattle_frequent), summ$config_id),
                       c("no_pri_no_av", "no_pri_av", "pri_no_av")),
