@@ -425,6 +425,13 @@ log_done <- function(label, t0) {
 log_sub <- function(...) {
   .tee(sprintf("           %s\n", paste0(..., collapse = "")))
 }
+# Write to a temporary file, then rename: a run stopped mid-write never leaves a
+# truncated cache file behind.
+save_rds_atomic <- function(x, path) {
+  tmp <- paste0(path, ".tmp")
+  saveRDS(x, tmp)
+  if (!file.rename(tmp, path)) stop("Could not write ", path)
+}
 fmt_dur <- function(secs) {
   if (!is.finite(secs)) return("?")
   if (secs < 60) return(sprintf("%.0fs", secs))
@@ -5563,7 +5570,7 @@ for (i in seq_len(nrow(configs_to_run))) {
           mnl_b_vc_drive       = B$vc_drive,
           parking_sig          = digest::digest(trips_in$parking_money_usd))
       )
-      saveRDS(bundle, scen_cache)
+      save_rds_atomic(bundle, scen_cache)
     }
 
     # ---- Static-data extractors: now CACHED into the bundle. ----
@@ -5660,7 +5667,7 @@ for (i in seq_len(nrow(configs_to_run))) {
       bundle$walkshed_row$tod <- tn
     if (!"tod" %in% names(bundle$vmt_by_category_long))
       bundle$vmt_by_category_long$tod <- tn
-    saveRDS(bundle, scen_cache)  # persist static extractors so HITs skip them
+    save_rds_atomic(bundle, scen_cache)  # persist static extractors so HITs skip them
     } else {
       log_msg(sprintf("[%s × %s] static-data extractors: cache HIT (loaded from bundle)",
                       cfg$config_id, tn))

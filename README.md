@@ -16,6 +16,19 @@ Everything is R (developed on R 4.5.2, Windows, 16 cores / 110 GB RAM; the `--qu
 [r5r](https://ipeagit.github.io/r5r/) (needs Java 21) and
 [dodgr](https://urbananalyst.github.io/dodgr/).
 
+## Note since publication
+
+After the thesis was published I found that the AM peak window had been applied
+inconsistently: it should be 7-10 a.m., but the Phase 2 runs behind the published
+results used 7-9 a.m. This code uses 7-10 a.m. throughout, so some numbers it produces
+differ slightly from the published tables. In addition, several inputs are read from
+live data sources (for example SDOT's collision and parking data), which change over
+time and will also move some numbers. As of November 27, 2026, I have re-run the full
+pipeline and verified that every conclusion is unchanged and that the numbers quoted in
+the text differ only slightly (for example, the best median transit trip is 20.4 rather
+than 20.5 minutes, and the Grid-Based network gives access to 253% rather than 249% more
+jobs within 30 minutes).
+
 ## How to run
 
 ```
@@ -24,16 +37,21 @@ Rscript run_pipeline.R --quick      # stages 1-6, with Phase 2 reduced to five c
 Rscript run_pipeline.R 5 7          # only stages 5..7
 Rscript run_pipeline.R --workers 3  # how many R processes run side by side
 Rscript run_pipeline.R --status     # progress of a run in progress (also in logs/STATUS.txt)
+Rscript run_pipeline.R --stop       # stop a run cleanly (from a second terminal)
 Rscript run_pipeline.R --list       # show the stage list
 ```
 
-Run from the repository root, after placing the input data (see "Data"). Every notebook
+Run from the repository root (or call the script by its full path from any folder),
+after placing the input data (see "Data"). Every notebook
 render is its own R process: console output goes to `logs/<name>.log`, progress (the
 chunk it is in, plus the notebook's own progress messages) to `logs/<name>.progress.log`,
 and a finished render leaves `logs/<name>.done` so it is skipped next time.
 `--status` (or `logs/STATUS.txt`, refreshed every 15 seconds while a run is going) shows
 each stage's state, how long each running render has been going, and its latest
-progress line. Every notebook can also be opened and run interactively in RStudio, with
+progress line. `--stop` ends the renders in progress (and everything they started)
+within about 15 seconds; running the same command again resumes. Phase 2 caches each
+configuration x time-of-day equilibrium as it finishes, so a stop loses at most the
+equilibria that were in progress. Every notebook can also be opened and run interactively in RStudio, with
 the repository root as the working directory.
 
 Phase 2 and the sensitivity analysis run in parallel. For Phase 2, a primer render

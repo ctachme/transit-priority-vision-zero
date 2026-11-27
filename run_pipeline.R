@@ -6,12 +6,15 @@
 #   Rscript run_pipeline.R --quick         # stages 1-6, with Phase 2 reduced to five check runs
 #   Rscript run_pipeline.R --workers 3     # R processes run side by side (default: RAM / 20 GB)
 #   Rscript run_pipeline.R --status        # progress of the current run (also kept in logs/STATUS.txt)
+#   Rscript run_pipeline.R --stop          # stop a run cleanly (from a second terminal); rerun to resume
 #   Rscript run_pipeline.R --list          # print the stage list and exit
 #
 # Run it from the repository root. Every notebook render is its own R process (clean
 # Java VM for r5r). A finished render writes logs/<name>.done and is skipped on the next
 # call, so an interrupted run resumes where it stopped; delete the .done file (or the
-# whole logs/ folder) to force it to run again. The run stops at the first stage that
+# whole logs/ folder) to force it to run again. Within Phase 2 every finished
+# configuration x time-of-day equilibrium is cached as it completes, so a stopped
+# configuration render redoes at most the time of day it was in the middle of. The run stops at the first stage that
 # fails; each render's console output is in logs/<name>.log and its progress (current
 # chunk, plus the notebook's own progress messages) in logs/<name>.progress.log.
 #
@@ -60,8 +63,18 @@ WORKER_HEAP_GB <- 16L             # Java heap per parallel Phase 2 render
 # ---------------------------------------------------------------- arguments
 args  <- commandArgs(trailingOnly = TRUE)
 quick <- "--quick" %in% args
+# Work from the repository root whichever folder the script is called from
+# (e.g. `Rscript C:/path/to/repo/run_pipeline.R --status`).
+.self <- sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE))
+if (length(.self) == 1) setwd(dirname(normalizePath(.self)))
 if (!file.exists("run_pipeline.R")) stop("Run this script from the repository root.")
 dir.create("logs", showWarnings = FALSE)
+if ("--stop" %in% args) {
+  writeLines(format(Sys.time()), file.path("logs", "STOP"))
+  cat("Stop requested: the running pipeline ends its renders within ~15 s and exits.\n",
+      "Run the same command again to resume.\n", sep = "")
+  quit(status = 0)
+}
 if ("--list" %in% args) {
   cat(sprintf("%d  %s\n", seq_along(stages), stages), sep = "")
   quit(status = 0)
@@ -133,7 +146,7 @@ start_job <- function(j) {
     sprintf("rmd <- file.path(tempdir(), %s); file.copy(%s, rmd)", deparse(j$rmd), deparse(j$rmd)),
     "rmarkdown::render(rmd, output_format = 'html_document', run_pandoc = FALSE, knit_root_dir = getwd(),",
     "                  params = prm, quiet = FALSE, envir = new.env())"), script)
-  for (ext in c(".done", ".failed")) unlink(lf(j$name, ext))
+  for (ext in c(".done", ".failed", ".stopped")) unlink(lf(j$name, ext))
   writeLines(stamp(), lf(j$name, ".started"))
   writeLines("", lf(j$name, ".progress.log"))
   rscript <- file.path(R.home("bin"), if (.Platform$OS.type == "windows") "Rscript.exe" else "Rscript")
@@ -142,13 +155,27 @@ start_job <- function(j) {
 }
 
 # Runs jobs `n` at a time; returns the names of the ones that failed. After a
-# failure, jobs already running finish but no new ones start.
+# failure, jobs already running finish but no new ones start. If logs/STOP appears
+# (--stop), the running renders and everything they started are killed, marked
+# .stopped, and `stop_requested` is set.
+stop_requested <- FALSE
 run_jobs <- function(jobs, n) {
   done  <- vapply(jobs, function(j) file.exists(lf(j$name, ".done")), logical(1))
   for (j in jobs[done]) cat(sprintf("[%s]   %s already done - skipping\n", stamp(), j$name))
   queue <- jobs[!done]
   running <- list(); failed <- character()
   while (length(queue) || length(running)) {
+    if (file.exists(lf("STOP", ""))) {
+      for (nm in names(running)) {
+        try(running[[nm]]$kill_tree(), silent = TRUE)
+        unlink(lf(nm, ".started"))
+        writeLines(sprintf("at %s", stamp()), lf(nm, ".stopped"))
+        cat(sprintf("[%s]   %s stopped\n", stamp(), nm))
+      }
+      stop_requested <<- TRUE
+      writeLines(status_text(), lf("STATUS", ".txt"))
+      return(failed)
+    }
     for (nm in names(running)) {
       p <- running[[nm]]
       if (p$is_alive()) next
@@ -186,7 +213,9 @@ last_lines <- function(f, n = 1, pattern = NULL, invert = FALSE) {
 job_state <- function(name) {
   if (file.exists(lf(name, ".done")))   return(paste("done     ", readLines(lf(name, ".done"))[1]))
   if (file.exists(lf(name, ".failed"))) return(paste("FAILED   ", readLines(lf(name, ".failed"))[1]))
-  if (!file.exists(lf(name, ".started"))) return("pending")
+  if (!file.exists(lf(name, ".started")))
+    return(if (file.exists(lf(name, ".stopped"))) paste("stopped  ", readLines(lf(name, ".stopped"))[1],
+                                                         "- resumes on the next run") else "pending")
   st <- as.POSIXct(readLines(lf(name, ".started"))[1])
   idle <- as.numeric(difftime(Sys.time(), file.info(lf(name, ".progress.log"))$mtime, units = "mins"))
   sprintf("running  since %s (%.0f min), last progress %.0f min ago",
@@ -203,7 +232,10 @@ status_text <- function() {
   rng  <- regmatches(mode, regexec("stages ([0-9]+)-([0-9]+)", mode))[[1]]
   in_run <- if (length(rng) == 3) seq(as.integer(rng[2]), as.integer(rng[3])) else seq_along(stages)
   out  <- c(sprintf("Pipeline status at %s", stamp()), sprintf("Run: %s", mode), "")
-  started <- function(jobs) any(file.exists(lf(vapply(jobs, `[[`, "", "name"), ".started")))
+  started <- function(jobs) {             # has this variant of the stage run (or been stopped)?
+    nm <- vapply(jobs, `[[`, "", "name")
+    any(file.exists(c(lf(nm, ".started"), lf(nm, ".stopped"))))
+  }
   for (i in seq_along(stages)) {
     jobs   <- unlist(stage_jobs(stages[i], q), recursive = FALSE)
     other  <- unlist(stage_jobs(stages[i], !q), recursive = FALSE)
@@ -213,14 +245,26 @@ status_text <- function() {
     states <- vapply(names, job_state, "")
     overall <- if (all(startsWith(states, "done"))) "done" else
       if (any(startsWith(states, "FAILED"))) "FAILED" else
-      if (any(!startsWith(states, "pending"))) "running" else "pending"
+      if (any(startsWith(states, "running"))) "running" else
+      if (any(startsWith(states, "stopped"))) "stopped" else
+      if (any(startsWith(states, "done"))) "partly done" else "pending"
     if (overall == "pending" && !i %in% in_run) overall <- states[] <- "not in this run"
     single <- length(names) == 1
     out <- c(out, sprintf("%d  %-26s %s", i, stages[i], if (single) states[1] else overall))
+    # Full Phase 2: count finished configuration x time-of-day equilibria per worker.
+    cfg_jobs <- names %in% paste0("Phase2RunSimulation_", CONFIGS)
+    n_tod <- setNames(integer(length(names)), names)
+    for (nm in names[cfg_jobs])
+      n_tod[nm] <- if (startsWith(states[nm], "done")) 5L else
+        length(last_lines(lf(nm, ".progress.log"), Inf, "] DONE CONFIG "))
+    if (any(cfg_jobs) && !overall %in% c("pending", "not in this run"))
+      out <- c(out, sprintf("     equilibria finished: %d of %d (configuration x time of day)", sum(n_tod), 5L * sum(cfg_jobs)))
     for (k in seq_along(names)) {
-      if (!single && overall != "pending")
-        out <- c(out, sprintf("     %-50s %s", sub("^Phase2RunSimulation_", "", names[k]), states[k]))
-      if (!startsWith(states[k], "done") && !startsWith(states[k], "pending"))
+      if (!single && !overall %in% c("pending", "not in this run"))
+        out <- c(out, sprintf("     %-50s %s%s", sub("^Phase2RunSimulation_", "", names[k]), states[k],
+                              if (cfg_jobs[k] && !startsWith(states[k], "done"))
+                                sprintf("  [%d/5 times of day]", n_tod[k]) else ""))
+      if (startsWith(states[k], "running") || startsWith(states[k], "FAILED"))
         out <- c(out, job_detail(names[k], "        "))
     }
     if (stages[i] == "SensitivityAnalysis.Rmd" && overall != "done") {
@@ -242,6 +286,7 @@ if ("--status" %in% args) {
 }
 
 # ---------------------------------------------------------------- run
+unlink(lf("STOP", ""))
 writeLines(sprintf("%s, stages %d-%d, %d worker(s), started %s",
                    if (quick) "quick check" else "full run", first, last, workers, stamp()),
            lf("run_mode", ".txt"))
@@ -251,6 +296,11 @@ for (i in first:last) {
   cat(sprintf("[%s] stage %d %s\n", stamp(), i, stages[i]))
   for (group in stage_jobs(stages[i], quick)) {
     failed <- run_jobs(group, workers)
+    if (stop_requested) {
+      cat(sprintf("[%s] stopped on request during stage %d; run the same command to resume\n", stamp(), i))
+      unlink(lf("STOP", ""))
+      quit(status = 0)
+    }
     if (length(failed)) {
       cat(sprintf("[%s] stopped: stage %d failed (%s)\n", stamp(), i, paste(failed, collapse = ", ")))
       quit(status = 1)
